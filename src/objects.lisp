@@ -866,6 +866,9 @@ its key prefix matches no object in this org." id)))))
   "OBJECT's sObject type.  If it has none, infer it from OBJECT's Id key
    prefix and store it on OBJECT, so everything downstream (REST path,
    Bulk CSV) can just read SOBJECT-TYPE."
+  (unless (typep object 'sobject)
+    (error 'sf-api-error
+           :message (format nil "DATABASE-* calls take SOBJECT instances, got ~S." object)))
   (let ((type (sobject-type object)))
     (cond ((and type (plusp (length type))) type)
           ((sobject-id object)
@@ -1069,6 +1072,9 @@ Did you mean DATABASE-INSERT?"))
   (cond ((typep objects 'sobject)
          (%resolve-type objects conn)
          (funcall one-fn objects))
+        ;; a string is a sequence, but never a sequence of SOBJECTs
+        ((or (stringp objects) (not (typep objects 'sequence)))
+         (%resolve-type objects conn))        ; signals the SF-API-ERROR
         (t (let ((list (coerce objects 'list)))
              (%require-one-type list conn)
              (if (and bulk-threshold (> (length list) bulk-threshold))

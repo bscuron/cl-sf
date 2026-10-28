@@ -532,3 +532,14 @@
 (define-test database-delete/sobject-without-id-is-an-error
   :parent objects
   (fail (cl-sf/objects:database-delete (make-instance 'test-contact)) 'cl-sf/api:sf-api-error))
+
+(define-test database-calls/non-sobjects-are-an-sf-api-error
+  :parent objects
+  (let ((log '()))
+    (with-stubbed-dml (log)
+      (fail (cl-sf/objects:database-delete "001xx000003DGb2AAG") 'cl-sf/api:sf-api-error)
+      (fail (cl-sf/objects:database-delete 42) 'cl-sf/api:sf-api-error)
+      (fail (cl-sf/objects:database-delete (list "001xx000003DGb2AAG")) 'cl-sf/api:sf-api-error)
+      (fail (cl-sf/objects:database-insert (list (make-instance 'test-contact) :oops))
+            'cl-sf/api:sf-api-error)
+      (is equal '() log))))
