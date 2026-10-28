@@ -385,3 +385,23 @@
   :parent objects
   (with-stubbed-queries (:first (mock-query-response :total 0))
     (is equalp #() (cl-sf/api::%query-records nil "q"))))
+
+(define-test select/returns-typed-clos-objects
+  :parent objects
+  (flet ((rec (id last-name)
+           (let ((h (make-hash-table :test #'equal))
+                 (attrs (make-hash-table :test #'equal)))
+             (setf (gethash "type" attrs) "TestContact"
+                   (gethash "attributes" h) attrs
+                   (gethash "Id" h) id
+                   (gethash "LastName" h) last-name)
+             h)))
+    (with-stubbed-queries
+        (:first (mock-query-response :total 2 :done t
+                                     :records (vector (rec "003A" "Hopper") (rec "003B" "Turing"))))
+      (let ((result (cl-sf/objects:select id last-name from testcontact)))
+        (true (simple-vector-p result))
+        (is = 2 (length result))
+        (true (typep (aref result 0) 'test-contact))
+        (is string= "Hopper" (test-contact-last-name (aref result 0)))
+        (is string= "003B" (cl-sf/objects:sobject-id (aref result 1)))))))
