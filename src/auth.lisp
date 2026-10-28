@@ -260,11 +260,11 @@ JWT connections re-authenticate by calling CONNECT/JWT again."))
 ;;; ──────────────────────────────────────────────────────────────────
 
 (defparameter *sf-dir*
-  (merge-pathnames ".sf/" (user-homedir-pathname))
+  (uiop:subpathname (user-homedir-pathname) ".sf/")
   "Root of the sf CLI's on-disk state.  Override for testing.")
 
 (defparameter *sfdx-dir*
-  (merge-pathnames ".sfdx/" (user-homedir-pathname))
+  (uiop:subpathname (user-homedir-pathname) ".sfdx/")
   "Root of the legacy sfdx CLI's on-disk state.  Override for testing.")
 
 (defun %try-parse-json-file (path)
@@ -286,9 +286,9 @@ JWT connections re-authenticate by calling CONNECT/JWT again."))
    config.json orgs map, ~/.sfdx's sfdx-config.json orgs map, ~/.sfdx's
    alias.json orgs map.  Falls back to the input itself (treated as already
    a literal username) if nothing matches."
-  (let* ((sf-cfg     (%try-parse-json-file (merge-pathnames "config.json" *sf-dir*)))
-         (sfdx-cfg   (%try-parse-json-file (merge-pathnames "sfdx-config.json" *sfdx-dir*)))
-         (sfdx-alias (%try-parse-json-file (merge-pathnames "alias.json" *sfdx-dir*)))
+  (let* ((sf-cfg     (%try-parse-json-file (uiop:subpathname *sf-dir* "config.json")))
+         (sfdx-cfg   (%try-parse-json-file (uiop:subpathname *sfdx-dir* "sfdx-config.json")))
+         (sfdx-alias (%try-parse-json-file (uiop:subpathname *sfdx-dir* "alias.json")))
          (target     (or alias-or-username
                         (and sf-cfg   (gethash "target-org"      sf-cfg))
                         (and sfdx-cfg (gethash "defaultusername" sfdx-cfg)))))
@@ -316,7 +316,7 @@ configured in ~/.sf/config.json (\"target-org\") or \
    use when the OS keychain is unavailable.  Signals SF-AUTH-ERROR if absent,
    meaning this org's secrets live in the OS keychain instead, which cl-sf
    does not read."
-  (let ((data (%try-parse-json-file (merge-pathnames "key.json" *sfdx-dir*))))
+  (let ((data (%try-parse-json-file (uiop:subpathname *sfdx-dir* "key.json"))))
     (or (and data (gethash "key" data))
         (error 'sf-auth-error
                :message "No ~/.sfdx/key.json found — this org's refresh \
@@ -364,7 +364,7 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
 (defun %load-sf-org-file (username)
   "Read ~/.sf/orgs/<USERNAME>.json.  Returns a plist, or NIL if absent."
   (let ((data (%try-parse-json-file
-               (merge-pathnames (format nil "orgs/~A.json" username) *sf-dir*))))
+               (uiop:subpathname *sf-dir* (format nil "orgs/~A.json" username)))))
     (when data
       (list :org-id       (gethash "orgId"       data)
             :instance-url (gethash "instanceUrl" data)
@@ -375,7 +375,7 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
   "Read ~/.sfdx/<USERNAME>.json, decrypting accessToken/refreshToken.
    Returns a plist, or NIL if absent."
   (let ((data (%try-parse-json-file
-               (merge-pathnames (format nil "~A.json" username) *sfdx-dir*))))
+               (uiop:subpathname *sfdx-dir* (format nil "~A.json" username)))))
     (when data
       (let ((key (%sfdx-encryption-key)))
         (list :org-id        (gethash "orgId"       data)
@@ -410,6 +410,7 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
 
 (defun %write-json-file (path data)
   (with-open-file (out path :direction :output :if-exists :supersede
+                            :external-format :utf-8
                             :if-does-not-exist :create)
     (write-string (com.inuoe.jzon:stringify data) out)))
 
@@ -421,15 +422,15 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
    CONN remains perfectly usable either way."
   (let ((username (connection-username conn)))
     (when username
-      (let ((sf-path (merge-pathnames (format nil "orgs/~A.json" username) *sf-dir*)))
-        (when (probe-file sf-path)
+      (let ((sf-path (uiop:subpathname *sf-dir* (format nil "orgs/~A.json" username))))
+        (when (uiop:file-exists-p sf-path)
           (handler-case
               (let ((data (com.inuoe.jzon:parse (uiop:read-file-string sf-path))))
                 (setf (gethash "accessToken" data) (connection-access-token conn))
                 (%write-json-file sf-path data))
             (error (e) (warn "cl-sf: failed to update ~A: ~A" sf-path e)))))
-      (let ((sfdx-path (merge-pathnames (format nil "~A.json" username) *sfdx-dir*)))
-        (when (probe-file sfdx-path)
+      (let ((sfdx-path (uiop:subpathname *sfdx-dir* (format nil "~A.json" username))))
+        (when (uiop:file-exists-p sfdx-path)
           (handler-case
               (let ((data (com.inuoe.jzon:parse (uiop:read-file-string sfdx-path)))
                     (key  (%sfdx-encryption-key)))
@@ -643,12 +644,20 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
         (%der-read-length der-bytes (1+ pos))
       (subseq der-bytes inner-start (+ inner-start inner-len)))))
 
+(defun %to-pathname (path)
+  "Coerce PATH (pathname or string) to a pathname.  Strings may use native
+   Windows (drive-letter, backslash) or Unix (/home/u/a.pem) syntax."
+  (if (stringp path)
+      (uiop:parse-unix-namestring
+       (if (uiop:os-windows-p) (substitute #\/ #\\ path) path))
+      path))
+
 (defun %load-rsa-private-key (key-file)
   "Load an RSA private key from a PEM file.
    Supports both PKCS#1 (BEGIN RSA PRIVATE KEY) and
    PKCS#8 unencrypted (BEGIN PRIVATE KEY) formats.
    Returns an IRONCLAD:RSA-PRIVATE-KEY."
-  (let* ((pem    (uiop:read-file-string key-file))
+  (let* ((pem    (uiop:read-file-string (%to-pathname key-file)))
          (pkcs8p (search "BEGIN PRIVATE KEY" pem))  ; not "RSA PRIVATE KEY"
          ;; Strip PEM armour lines and all whitespace, leaving raw base64
          (b64    (cl-ppcre:regex-replace-all "(?m)-----[^-]+-----|\\s" pem ""))
