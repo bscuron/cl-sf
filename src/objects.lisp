@@ -15,6 +15,9 @@
 
 (in-package #:cl-sf/objects)
 
+;; Defined in cl-sf/bulk, which loads after this file (it needs our classes).
+(declaim (special cl-sf/bulk:*bulk-threshold*))
+
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Registries
 ;;; ──────────────────────────────────────────────────────────────────
@@ -1541,7 +1544,7 @@ Did you mean SOBJECT-CREATE?"))
   (if (and threshold (> (length objects) threshold))
       (cl-sf/bulk:bulk-delete objects :conn conn)
       (dolist (obj objects t)
-        (sobject-delete obj :conn conn))))
+        (sobject-delete obj nil :conn conn))))
 
 (defun sobject-upsert-many (objects external-id-field &key (conn *connection*)
                             (threshold cl-sf/bulk:*bulk-threshold*))
