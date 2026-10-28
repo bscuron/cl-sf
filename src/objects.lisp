@@ -5,7 +5,7 @@
 ;;;;   - SOBJECT base class (all Salesforce records are instances of this or a subclass)
 ;;;;   - DEFINE-SOBJECT-CLASS macro (generates typed subclasses)
 ;;;;   - HASH->SOBJECT / SOBJECT->HASH-TABLE (conversion boundary)
-;;;;   - Public wrappers: QUERY, SOBJECT-GET, SOBJECT-CREATE, etc.
+;;;;   - SELECT (SOQL queries) and the wrappers SOBJECT-GET, SOBJECT-CREATE, etc.
 ;;;;     All of these call cl-sf/api:% internals and convert at the boundary.
 ;;;;
 ;;;; The CLOS layer is the ONLY layer the user touches.
@@ -153,8 +153,8 @@
 (defvar *sobject-registration-lock* (sb-thread:make-mutex :name "sobject-class-registration")
   "Guards lazy CLOS class generation (EVAL + DEFINE-SOBJECT-CLASS) against
    concurrent registration of the SAME type from multiple threads — e.g.
-   two LAZY-RESULT-SET pages being prefetched in parallel that both first
-   encounter a given sObject type at the same time.")
+   two threads (e.g. parallel bulk workers) that both first encounter a
+   given sObject type at the same time.")
 
 (defun %eval-define-sobject-class (name desc)
   "Build and EVAL a DEFINE-SOBJECT-CLASS form for sObject NAME from its
@@ -319,59 +319,56 @@
        ',class-name)))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; SOQL DSL — Apex-style s-expression syntax, compiled to SOQL text
+;;; SELECT — SOQL written as Lisp tokens, compiled to SOQL text
 ;;;
 ;;; (let ((min-revenue 1000000))
-;;;   (soql SELECT Id Name CreatedBy.Name
-;;;         FROM Account
-;;;         WHERE (AND (> AnnualRevenue min-revenue)
-;;;                    (= Industry "Technology"))
-;;;         ORDER BY Name ASC
-;;;         LIMIT 10))
+;;;   (select Id Name CreatedBy.Name
+;;;           FROM Account
+;;;           WHERE AnnualRevenue > min-revenue AND Industry = "Technology"
+;;;           ORDER BY Name DESC NULLS LAST
+;;;           LIMIT 10))
 ;;;
-;;; Compiles to a literal string at macro-expansion time when fully static
-;;; (the common case — zero runtime cost); a VALUE position only defers to
-;;; a runtime CONCATENATE when it's actually bound to something in scope.
+;;; The grammar is Salesforce's own (clause order and keywords exactly as in
+;;; the SOQL reference), with two reader-forced differences: there are no
+;;; commas (the Lisp reader rejects a bare `,`, so lists are whitespace
+;;; separated), and the leading SELECT is implied by the macro name.
 ;;;
-;;; Covers the full grammar: SELECT (dotted relationship paths, nested
-;;; subqueries, TYPEOF, a bare * wildcard, and a (FIELDS expr) runtime
-;;; field-name-list escape — see below, neither is native SOQL), FROM,
-;;; WHERE/HAVING, GROUP BY (incl. CUBE/ROLLUP), ORDER BY (incl. ASC/DESC/
-;;; NULLS FIRST/LAST), LIMIT, OFFSET, FOR VIEW/REFERENCE, UPDATE
-;;; TRACKING/VIEWSTAT, USING SCOPE, and WITH (generic passthrough — covers
-;;; DATA CATEGORY as well as modern SECURITY_ENFORCED / USER_MODE).
+;;;   fields      Id  Name  Owner.Name  (COUNT Id) cnt  (FIELDS ALL)
+;;;               (SELECT Id FROM Contacts)        child subquery
+;;;               TYPEOF What WHEN Account THEN Phone ELSE Name END
+;;;               A function is a list: (name arg...).  A bare symbol right
+;;;               after a function is its alias (SOQL has no AS).
+;;;   FROM        FROM Account [alias]
+;;;   USING       USING SCOPE Mine
+;;;   WHERE       infix: field op value, joined by AND / OR / NOT and
+;;;               parentheses.  op is = != <> < <= > >= LIKE IN NOT IN
+;;;               INCLUDES EXCLUDES.  The field side may be a function:
+;;;               (CALENDAR_YEAR CloseDate) = 2024
+;;;   WITH        passthrough: WITH SECURITY_ENFORCED, WITH DATA CATEGORY
+;;;               Geography__c AT (usa__c uk__c), ...
+;;;   GROUP BY    fields, or (ROLLUP f...) / (CUBE f...); then HAVING cond
+;;;   ORDER BY    field [ASC|DESC] [NULLS FIRST|LAST] ...
+;;;   LIMIT n  OFFSET n  FOR VIEW|REFERENCE|UPDATE  UPDATE TRACKING|VIEWSTAT
+;;;   SET OPTIONS (name = value ...)
+;;;   ALL ROWS    (SELECT only) include deleted/archived rows (queryAll)
 ;;;
-;;; SOQL itself has no SELECT * — a bare * in SELECT position is cl-sf
-;;; sugar: expanded at runtime to every queryable field of the query's FROM
-;;; type via DESCRIBE-SOBJECT (cached per type — see
-;;; %SOQL-WILDCARD-FIELD-NAMES), using *CONNECTION* (bind it, e.g. via
-;;; WITH-CONN, before using * if you're also passing QUERY an explicit
-;;; :CONN).  This is the one case where SOQL can't stay a zero-network,
-;;; compile-time-constant string — fine, since describe metadata is cheap
-;;; and cached.  (FIELDS expr) is the same mechanism without the
-;;; DESCRIBE-SOBJECT call, for any other runtime-computed field-name list.
+;;; VALUES (right of an operator, LIMIT, OFFSET) need no wrapper:
+;;;   "text" 42        literals (strings are escaped)
+;;;   min-revenue      a symbol bound in the surrounding Lisp code (let,
+;;;                    function parameter, special) -> its value, escaped
+;;;   (* base 2)       any other list is a Lisp expression -> its value
+;;;   NULL TRUE TODAY  an unbound symbol is emitted as SOQL text
+;;;   (RAW "LAST_N_DAYS:5")   verbatim text, for tokens the Lisp reader
+;;;                    can't read (a colon would be a package marker)
+;;; After IN / INCLUDES / EXCLUDES a list is literal values if it starts with
+;;; a string or number ("A" "B"); (SELECT ...) is a semi-join subquery; any
+;;; other list or bound symbol is a Lisp expression returning a list.
+;;; Runtime values are rendered by %SOQL-RENDER-VALUE, which escapes them —
+;;; never splice a Lisp string into SOQL text yourself.
 ;;;
-;;; WHERE/HAVING condition grammar (not specified by Salesforce's own BNF —
-;;; designed here): (AND c...) (OR c...) (NOT c)
-;;;   (op field value)       where op is = != < <= > >= LIKE
-;;;   (op field value-list)  where op is IN NOT-IN INCLUDES EXCLUDES
-;;;                          value-list is a QUOTED literal list ('("A" "B")),
-;;;                          a (SELECT ...) subquery (semi-join), a bound
-;;;                          variable, or any other (unquoted) list — a
-;;;                          Lisp expression evaluated at runtime, e.g.
-;;;                          (IN Status (compute-statuses))
-;;; A VALUE is a bare symbol that IS bound to something in the surrounding
-;;; code (a lexical variable, a function parameter, a special variable —
-;;; auto-inferred as a runtime value by asking the real macroexpansion
-;;; environment, see %SOQL-VARIABLE-P), a bare symbol that ISN'T bound
-;;; anywhere (a field reference or keyword literal like TODAY/NULL/TRUE —
-;;; so a field-to-field comparison like (> AnnualRevenue ProjectedRevenue)
-;;; still works literally), a string/number literal, or (VAL lisp-expr) for
-;;; anything the environment can't see a binding for.  Either way the
-;;; runtime value is rendered via %SOQL-RENDER-VALUE, which escapes it
-;;; properly — this is the
-;;; injection-safe way to parameterize a query; never splice a raw Lisp
-;;; string into SOQL text yourself.
+;;; Everything static folds into one constant string at macroexpansion
+;;; time; only value positions that use Lisp code defer to a runtime
+;;; CONCATENATE.
 ;;; ──────────────────────────────────────────────────────────────────
 
 (defun %soql-escape-string (s)
@@ -387,48 +384,37 @@
   (format nil "'~A'" (%soql-escape-string s)))
 
 (defun %soql-render-value (val)
-  "Runtime counterpart of the compile-time literal rules, used for (VAL ...)
-   escapes — renders an arbitrary Lisp VAL as SOQL text, safely escaped."
+  "Render an arbitrary Lisp VAL as SOQL text, safely escaped.  Used both at
+   macroexpansion time (literals) and at runtime (Lisp values in a query)."
   (etypecase val
     (string               (%soql-literal-string val))
     (null                 "NULL")
-    ((eql t)               "TRUE")
+    ((eql t)              "TRUE")
     (integer              (princ-to-string val))
-    (real                 (princ-to-string val))
+    (real                 (let ((*read-default-float-format* 'double-float))
+                            (prin1-to-string (float val 1d0))))
     (local-time:timestamp (local-time:format-timestring nil val))
-    (list                 (format nil "(~{~A~^, ~})" (mapcar #'%soql-render-value val)))))
+    (list                 (format nil "(~{~A~^, ~})" (mapcar #'%soql-render-value val)))
+    (vector               (%soql-render-value (coerce val 'list)))))
 
-(defun %soql-join-field-names (field-names)
-  "Render a runtime list of bare field-name strings for SELECT position —
-   unlike %SOQL-RENDER-VALUE, these are identifiers, not quoted literals."
-  (format nil "~{~A~^, ~}" field-names))
+;;; — Piece lists —
+;;; Every %SOQL-COMPILE-* / %SOQL-PARSE-* function returns a flat list of
+;;; PIECES: a literal string, or a Lisp form that evaluates to a string at
+;;; runtime.  %SOQL-STRING joins them.
 
-(defvar *wildcard-field-names-cache* (make-hash-table :test #'equal)
-  "Memoizes SELECT * field-name expansion per sObject type — avoids a
-   DESCRIBE-SOBJECT round-trip on every wildcard query for the same type.")
-
-(defun %soql-wildcard-field-names (type)
-  "All queryable field names for TYPE, used to expand a SELECT * — native
-   SOQL has no wildcard, so cl-sf resolves it client-side via
-   DESCRIBE-SOBJECT (using *CONNECTION*) and caches the result per type."
-  (or (gethash type *wildcard-field-names-cache*)
-      (setf (gethash type *wildcard-field-names-cache*)
-            (loop for field across (gethash "fields" (describe-sobject type :conn *connection*) #())
-                  collect (gethash "name" field)))))
-
-;;; — Compile-time piece-list helpers —
-;;; Every %SOQL-COMPILE-* function returns a flat list of PIECES: each piece
-;;; is either a literal string or a Lisp form that evaluates to a string at
-;;; runtime (from a VAL escape).  The top-level macro joins the whole flat
-;;; list with CONCATENATE — if every piece turned out to be a string, that
-;;; happens at macro-expansion time and the query becomes a plain constant.
-
-(defun %soql-lit (s) (list s))
 (defun %soql-cat (&rest piece-lists) (apply #'append piece-lists))
 
+(defun %soql-interpose (piece-lists sep)
+  "Join PIECE-LISTS with literal string SEP between each."
+  (loop for (pl . more) on piece-lists
+        append pl
+        when more collect sep))
+
+(defun %soql-kw= (x name)
+  (and x (symbolp x) (string-equal (symbol-name x) name)))
+
 (defun %soql-earmuffed-p (sym)
-  "T if SYM's name follows Lisp's own naming convention for an externally-
-   meaningful value — *special-variable* or +constant+ earmuffs.  Fallback
+  "T if SYM follows Lisp's *special* or +constant+ earmuff naming.  Fallback
    signal on implementations without SB-CLTL2 (see %SOQL-VARIABLE-P)."
   (let* ((name (symbol-name sym)) (len (length name)))
     (and (> len 2)
@@ -436,531 +422,342 @@
              (and (char= (char name 0) #\+) (char= (char name (1- len)) #\+))))))
 
 (defun %soql-variable-p (sym env)
-  "T if SYM is actually bound to something — lexically, specially, or as a
-   symbol-macro — at the SOQL form's call site, i.e. it's a real Lisp
-   variable in scope, not a bare SOQL field/keyword token.  Used to auto-
-   infer a runtime value in VALUE position without needing an explicit
-   (VAL ...) wrapper: plain (let ((revenue ...)) (soql ... (> AnnualRevenue
-   revenue))) and function parameters just work, no earmuffs needed.
-
-   This only ever looks at VALUE positions (the RHS of a comparison, LIMIT,
-   an IN-list element) — SELECT/FROM/GROUP-BY/ORDER-BY field references are
-   always literal, regardless of what's in scope, so there's no risk of a
-   same-named variable elsewhere hijacking a field reference on the LHS.
+  "T if SYM is bound — lexically, specially, or as a symbol-macro — at the
+   call site, i.e. it's a real Lisp variable in scope rather than a SOQL
+   field or keyword.  Only ever asked about VALUE positions, so a field
+   name elsewhere can never be hijacked by a same-named variable.
 
    On SBCL this asks the real lexical environment via SB-CLTL2.  Elsewhere
-   (no portable CLtL2 environment API) it falls back to the earmuff
-   convention only — see %SOQL-EARMUFFED-P."
+   it falls back to the earmuff convention (%SOQL-EARMUFFED-P)."
   #+sbcl
   (and (member (sb-cltl2:variable-information sym env) '(:lexical :special :symbol-macro))
        t)
   #-sbcl
   (progn env (%soql-earmuffed-p sym)))
 
-(defun %soql-interpose (piece-lists sep)
-  "Join a list of piece-lists with literal string SEP between each."
-  (if (null piece-lists)
-      nil
-      (reduce (lambda (acc pl) (append acc (list sep) pl))
-              (rest piece-lists)
-              :initial-value (first piece-lists))))
+;;; — Words, items, functions (compile-time text only) —
 
-(defparameter *soql-clause-keywords*
-  '("SELECT" "FROM" "WHERE" "GROUP" "HAVING" "ORDER"
-    "LIMIT" "OFFSET" "FOR" "UPDATE" "USING" "WITH")
-  "Top-level SOQL clause markers recognised by the SOQL macro's splitter.")
+(defun %soql-word (tok)
+  "TOK (symbol, string or number) as literal SOQL text."
+  (etypecase tok
+    (symbol (symbol-name tok))
+    ((or string number) (%soql-render-value tok))))
 
-(defun %soql-kw= (x name)
-  (and (symbolp x) (string= (symbol-name x) name)))
+(defun %soql-function-text (form)
+  "(COUNT Id) -> \"COUNT(ID)\"; arguments may be words or nested functions."
+  (unless (and (consp form) (symbolp (car form)))
+    (error "cl-sf: malformed SOQL function call: ~S" form))
+  (format nil "~A(~{~A~^, ~})" (symbol-name (car form))
+          (mapcar (lambda (a) (if (consp a) (%soql-function-text a) (%soql-word a)))
+                  (cdr form))))
 
-(defun %soql-split-clauses (body)
-  "Split the flat SOQL macro BODY into an ordered alist of
-   (clause-keyword-string . tokens-until-next-keyword).
-   Bare BY/SCOPE tokens (GROUP BY, ORDER BY, USING SCOPE) are dropped."
-  (let ((clauses '()) (current-kw nil) (current-toks '()))
-    (flet ((flush ()
-             (when current-kw
-               (push (cons current-kw (nreverse current-toks)) clauses))))
-      (dolist (tok body)
-        (cond
-          ((and (symbolp tok) (member (symbol-name tok) *soql-clause-keywords* :test #'string=))
-           (flush)
-           (setf current-kw (symbol-name tok) current-toks '()))
-          ((and (symbolp tok) (member (symbol-name tok) '("BY" "SCOPE") :test #'string=))
-           nil) ; syntactic sugar, discard
-          (t (push tok current-toks))))
-      (flush))
-    (unless clauses
-      (error "cl-sf: empty SOQL query"))
-    (nreverse clauses)))
+(defun %soql-item (tok)
+  "A field reference or function call, as text."
+  (cond ((consp tok) (%soql-function-text tok))
+        ((symbolp tok) (symbol-name tok))
+        (t (error "cl-sf: malformed SOQL field: ~S" tok))))
 
-(defun %soql-compile-value (value env)
-  "Compile a single WHERE/HAVING/LIMIT/OFFSET value.  A scalar value
-   position has no SOQL-domain meaning for a bare parenthesized form (no
-   nested lists appear here in real SOQL syntax — only in IN-list position,
-   handled separately by %SOQL-COMPILE-VALUE-LIST), so VALUE is:
-     - a bare symbol that's actually bound in scope (auto-inferred as a
-       runtime value via %SOQL-VARIABLE-P — plain lexical variables and
-       parameters just work, no earmuffs needed)
-     - a bare symbol that ISN'T bound anywhere — a field reference or
-       keyword literal like TODAY/NULL/TRUE, emitted as literal text
-     - a string/number literal
-     - ANY OTHER LIST — unambiguously a Lisp expression to evaluate
-       (a function call, arithmetic, whatever), since nothing else a list
-       could mean makes sense here.  (VAL expr) still works too (it's just
-       this case with an explicit marker) for forcing evaluation when ENV
-       can't see a binding, e.g. on non-SBCL fallback or exotic macro
-       contexts."
+;;; — Values —
+
+(defun %soql-value (v env)
+  "Compile one scalar value; see the section header for the rules."
   (cond
-    ((%soql-kw= (and (consp value) (first value)) "VAL")
-     (list `(%soql-render-value ,(second value))))
-    ((and (symbolp value) (%soql-variable-p value env))
-     (list `(%soql-render-value ,value)))
-    ((symbolp value)  (%soql-lit (symbol-name value)))
-    ((stringp value)  (%soql-lit (%soql-literal-string value)))
-    ((numberp value)  (%soql-lit (princ-to-string value)))
-    ((consp value)    (list `(%soql-render-value ,value)))
-    (t (error "cl-sf: malformed SOQL value: ~S" value))))
+    ((stringp v)  (list (%soql-literal-string v)))
+    ((numberp v)  (list (%soql-render-value v)))
+    ((null v)     (list "NULL"))
+    ((eq v t)     (list "TRUE"))
+    ((symbolp v)  (if (%soql-variable-p v env)
+                      (list `(%soql-render-value ,v))
+                      (list (symbol-name v))))
+    ((%soql-kw= (car v) "RAW")
+     (unless (stringp (second v))
+       (error "cl-sf: (RAW ...) takes a literal string, got ~S" v))
+     (list (second v)))
+    ((consp v)    (list `(%soql-render-value ,v)))
+    (t (error "cl-sf: malformed SOQL value: ~S" v))))
 
-(defun %soql-compile-value-list (value env)
-  "For IN/NOT-IN/INCLUDES/EXCLUDES — VALUE is:
-     - (SELECT ...)   a subquery (semi-join)
-     - (VAL expr)     an explicit runtime-evaluated escape
-     - 'literal-list  a QUOTED literal list of SOQL values — elements still
-                      follow %SOQL-COMPILE-VALUE's scalar rules, so a bound
-                      variable can appear inside too, e.g. '(a \"b\")
-     - a bare symbol bound in scope — a runtime value list
-     - ANY OTHER LIST — unambiguously a Lisp expression to evaluate (a
-       function call like (LIST ...), mirroring %SOQL-COMPILE-VALUE's
-       scalar rule for 'any other list'
-   The runtime cases render via %SOQL-RENDER-VALUE, which already wraps a
-   Lisp list in parens."
+(defun %soql-value-list (v env)
+  "Compile the right side of IN / NOT IN / INCLUDES / EXCLUDES."
   (cond
-    ((and (consp value) (%soql-kw= (first value) "SELECT"))
-     (%soql-cat '("(") (%soql-compile-query value env) '(")")))
-    ((%soql-kw= (and (consp value) (first value)) "VAL")
-     (list `(%soql-render-value ,(second value))))
-    ((and (consp value) (eq (first value) 'quote))
-     (%soql-cat '("(") (%soql-interpose (mapcar (lambda (v) (%soql-compile-value v env)) (second value)) ", ") '(")")))
-    ((and (symbolp value) (%soql-variable-p value env))
-     (list `(%soql-render-value ,value)))
-    ((consp value)
-     (list `(%soql-render-value ,value)))
-    (t (error "cl-sf: malformed SOQL value list: ~S" value))))
+    ((and (consp v) (%soql-kw= (car v) "SELECT"))
+     (%soql-cat '("(") (%soql-compile-query (cdr v) env) '(")")))
+    ((and (consp v) (not (symbolp (car v))))      ; ("A" "B" 3) literal list
+     (%soql-cat '("(")
+                (%soql-interpose (mapcar (lambda (e) (%soql-value e env)) v) ", ")
+                '(")")))
+    (t (%soql-value v env))))
 
-(defparameter *soql-comparison-ops* '("=" "!=" "<" "<=" ">" ">=" "LIKE"))
-(defparameter *soql-list-ops*       '("IN" "NOT-IN" "INCLUDES" "EXCLUDES"))
+;;; — WHERE / HAVING conditions: recursive descent, OR < AND < NOT —
+;;; Each %SOQL-PARSE-* takes the remaining token list and returns
+;;; (values pieces remaining-tokens).  Multi-part AND/OR groups are always
+;;; parenthesized, which is what SOQL requires when the two are mixed.
 
-(defun %soql-compile-condition (form env)
-  "Compile one WHERE/HAVING condition s-expression into a flat piece list."
-  (unless (and (consp form) (symbolp (first form)))
-    (error "cl-sf: malformed SOQL condition: ~S" form))
-  (let ((head (string-upcase (symbol-name (first form)))))
+(defparameter *soql-comparison-ops* '("=" "!=" "<>" "<" "<=" ">" ">=" "LIKE"))
+(defparameter *soql-list-ops*       '("IN" "INCLUDES" "EXCLUDES"))
+
+(defun %soql-operator-p (tok)
+  (and tok (symbolp tok)
+       (let ((n (symbol-name tok)))
+         (or (string= n "NOT")
+             (member n *soql-comparison-ops* :test #'string=)
+             (member n *soql-list-ops* :test #'string=)))))
+
+(defun %soql-parse-chain (toks env sep parse-operand)
+  "Parse OPERAND (SEP OPERAND)* — shared by OR and AND."
+  (let (parts)
+    (loop
+      (multiple-value-bind (pieces rest) (funcall parse-operand toks env)
+        (push pieces parts)
+        (setf toks rest))
+      (if (%soql-kw= (car toks) sep)
+          (pop toks)
+          (return)))
+    (values (if (cdr parts)
+                (%soql-cat '("(") (%soql-interpose (nreverse parts) (format nil " ~A " sep)) '(")"))
+                (first parts))
+            toks)))
+
+(defun %soql-parse-or (toks env)
+  (%soql-parse-chain toks env "OR" #'%soql-parse-and))
+
+(defun %soql-parse-and (toks env)
+  (%soql-parse-chain toks env "AND" #'%soql-parse-primary))
+
+(defun %soql-parse-primary (toks env)
+  (let ((tok (car toks)))
     (cond
-      ((string= head "AND")
-       (%soql-cat '("(") (%soql-interpose (mapcar (lambda (c) (%soql-compile-condition c env)) (rest form)) " AND ") '(")")))
-      ((string= head "OR")
-       (%soql-cat '("(") (%soql-interpose (mapcar (lambda (c) (%soql-compile-condition c env)) (rest form)) " OR ") '(")")))
-      ((string= head "NOT")
-       (%soql-cat '("(NOT ") (%soql-compile-condition (second form) env) '(")")))
-      ((member head *soql-comparison-ops* :test #'string=)
-       (destructuring-bind (field value) (rest form)
-         (%soql-cat (%soql-lit (symbol-name field))
-                    (%soql-lit (format nil " ~A " head))
-                    (%soql-compile-value value env))))
-      ((member head *soql-list-ops* :test #'string=)
-       (destructuring-bind (field value) (rest form)
-         (%soql-cat (%soql-lit (symbol-name field))
-                    (%soql-lit (format nil " ~A " (if (string= head "NOT-IN") "NOT IN" head)))
-                    (%soql-compile-value-list value env))))
-      (t (error "cl-sf: unknown SOQL condition operator ~S" (first form))))))
+      ((null toks) (error "cl-sf: SOQL condition ended unexpectedly"))
+      ((%soql-kw= tok "NOT")
+       (multiple-value-bind (pieces rest) (%soql-parse-primary (cdr toks) env)
+         (values (%soql-cat '("NOT ") pieces) rest)))
+      ;; A list followed by an operator is a function on the field side;
+      ;; any other list is a parenthesized sub-condition.
+      ((and (consp tok) (not (%soql-operator-p (cadr toks))))
+       (values (%soql-compile-condition tok env) (cdr toks)))
+      (t (%soql-parse-comparison toks env)))))
 
-(defun %soql-compile-typeof-branch (branch)
-  (destructuring-bind (kw &rest rest) branch
-    (let ((kwname (symbol-name kw)))
+(defun %soql-parse-comparison (toks env)
+  (let* ((lhs  (%soql-item (pop toks)))
+         (op   (pop toks))
+         (name (if (and op (symbolp op)) (symbol-name op)
+                   (error "cl-sf: expected a SOQL operator after ~A, got ~S" lhs op))))
+    (when (string= name "NOT")
+      (unless (%soql-kw= (pop toks) "IN")
+        (error "cl-sf: NOT after ~A must be followed by IN" lhs))
+      (setf name "NOT IN"))
+    (unless toks (error "cl-sf: missing value after ~A ~A" lhs name))
+    (let ((head (list (format nil "~A ~A " lhs name))))
       (cond
-        ((string= kwname "WHEN")
-         (let* ((type     (first rest))
-                (then-pos (position-if (lambda (x) (%soql-kw= x "THEN")) rest))
-                (fields   (subseq rest (1+ then-pos))))
-           (%soql-lit (format nil "WHEN ~A THEN ~{~A~^, ~}"
-                              (symbol-name type) (mapcar #'symbol-name fields)))))
-        ((string= kwname "ELSE")
-         (%soql-lit (format nil "ELSE ~{~A~^, ~}" (mapcar #'symbol-name rest))))
-        (t (error "cl-sf: malformed TYPEOF branch: ~S" branch))))))
+        ((or (string= name "NOT IN") (member name *soql-list-ops* :test #'string=))
+         (values (%soql-cat head (%soql-value-list (pop toks) env)) toks))
+        ((member name *soql-comparison-ops* :test #'string=)
+         (values (%soql-cat head (%soql-value (pop toks) env)) toks))
+        (t (error "cl-sf: unknown SOQL operator ~A" name))))))
 
-(defun %soql-compile-typeof (form)
-  "(TYPEOF What (WHEN Account THEN Phone) (WHEN Opportunity THEN Amount) (ELSE Name))"
-  (destructuring-bind (typeof-kw field-name &rest branches) form
-    (declare (ignore typeof-kw))
-    (%soql-cat (%soql-lit (format nil "TYPEOF ~A " (symbol-name field-name)))
-              (%soql-interpose (mapcar #'%soql-compile-typeof-branch branches) " ")
-              '(" END"))))
+(defun %soql-compile-condition (toks env)
+  "Compile all of TOKS as one WHERE/HAVING condition."
+  (multiple-value-bind (pieces rest) (%soql-parse-or toks env)
+    (when rest (error "cl-sf: unexpected ~S in SOQL condition" (car rest)))
+    pieces))
 
-(defun %soql-compile-field-list (tokens env &optional from-type)
-  "SELECT field list (also used for a plain GROUP BY field list, which
-   never has a wildcard — FROM-TYPE is NIL there) — entries are bare field
-   symbols, nested (SELECT ...) subqueries, TYPEOF forms, a (FIELDS expr)
-   runtime field-name-list escape, or a bare * wildcard (needs FROM-TYPE;
-   see %SOQL-WILDCARD-FIELD-NAMES).
+;;; — Clauses —
 
-   Id is required to later UPDATE/DELETE/UPSERT a fetched record, and is
-   easy to forget — when FROM-TYPE is given (a real SELECT, not a GROUP
-   BY) and TOKENS is a plain list of bare field symbols (no wildcard,
-   subquery, TYPEOF, or runtime FIELDS escape to reason about at
-   macroexpansion time) with no \"ID\" among them already, Id is
-   prepended automatically.  SELECT * already pulls every field
-   (including Id) via DESCRIBE-SOBJECT, so it needs no help here."
-  (when (and from-type
-             (every #'symbolp tokens)
-             (notany (lambda (tok) (%soql-kw= tok "*")) tokens)
-             (notany (lambda (tok) (string-equal (symbol-name tok) "ID")) tokens))
-    (setf tokens (cons 'cl-sf/objects::id tokens)))
-  (%soql-interpose
-   (mapcar (lambda (tok)
-             (cond
-               ((and (consp tok) (%soql-kw= (first tok) "SELECT"))
-                (%soql-cat '("(") (%soql-compile-query tok env) '(")")))
-               ((and (consp tok) (%soql-kw= (first tok) "TYPEOF"))
-                (%soql-compile-typeof tok))
-               ((and (consp tok) (%soql-kw= (first tok) "FIELDS"))
-                (list `(%soql-join-field-names ,(second tok))))
-               ((%soql-kw= tok "*")
-                (unless from-type
-                  (error "cl-sf: SELECT * requires a single, literal FROM type"))
-                (list `(%soql-join-field-names (%soql-wildcard-field-names ,from-type))))
-               ((symbolp tok) (%soql-lit (symbol-name tok)))
-               (t (error "cl-sf: malformed SELECT field: ~S" tok))))
-           tokens)
-   ", "))
+(defun %soql-compile-typeof (toks)
+  "TOKS follow TYPEOF, up to and including END.  Returns (values text rest)."
+  (let ((end (position-if (lambda (x) (%soql-kw= x "END")) toks)))
+    (unless end (error "cl-sf: TYPEOF without END"))
+    (let ((body (subseq toks 0 end)) (fields nil) (first-field nil))
+      (values
+       (with-output-to-string (s)
+         (format s "TYPEOF ~A" (%soql-word (pop body)))
+         (dolist (tok body)
+           (let ((word (%soql-word tok)))
+             (cond ((%soql-kw= tok "WHEN") (setf fields nil) (format s " ~A" word))
+                   ((or (%soql-kw= tok "THEN") (%soql-kw= tok "ELSE"))
+                    (setf fields t first-field t) (format s " ~A" word))
+                   (fields (format s (if first-field " ~A" ", ~A") word)
+                           (setf first-field nil))
+                   (t (format s " ~A" word)))))
+         (write-string " END" s))
+       (nthcdr (1+ end) toks)))))
 
-(defun %soql-compile-group-by (toks env)
-  "Plain field list, or a single (CUBE field...) / (ROLLUP field...) form."
-  (if (and (= (length toks) 1) (consp (first toks))
-           (member (symbol-name (first (first toks))) '("CUBE" "ROLLUP") :test #'string=))
-      (let ((kw (symbol-name (first (first toks)))) (fields (rest (first toks))))
-        (%soql-cat (%soql-lit (format nil "~A(" kw))
-                  (%soql-interpose (mapcar (lambda (f) (%soql-lit (symbol-name f))) fields) ", ")
-                  '(")")))
-      (%soql-compile-field-list toks env)))
+(defun %soql-compile-select-list (toks env)
+  (let (items)
+    (loop while toks
+          do (let ((tok (pop toks)))
+               (push
+                (cond
+                  ((%soql-kw= tok "TYPEOF")
+                   (multiple-value-bind (text rest) (%soql-compile-typeof toks)
+                     (setf toks rest)
+                     (list text)))
+                  ((and (consp tok) (%soql-kw= (car tok) "SELECT"))
+                   (%soql-cat '("(") (%soql-compile-query (cdr tok) env) '(")")))
+                  ((consp tok)
+                   (let ((text (%soql-function-text tok)))
+                     ;; a symbol right after a function is its alias
+                     (if (and toks (symbolp (car toks)) (not (%soql-kw= (car toks) "TYPEOF")))
+                         (list (format nil "~A ~A" text (symbol-name (pop toks))))
+                         (list text))))
+                  (t (list (%soql-item tok))))
+                items)))
+    (unless items (error "cl-sf: SELECT needs at least one field"))
+    (%soql-interpose (nreverse items) ", ")))
 
-(defparameter *soql-order-modifiers* '("ASC" "DESC" "NULLS" "FIRST" "LAST")
-  "ORDER BY modifier keywords — any other token starts a new field entry.")
-
-(defun %soql-compile-order-by (toks)
-  "TOKS is a flat stream: field [ASC|DESC] [NULLS FIRST|LAST] field ...
-   (no commas — Lisp lists don't need them).  A token starts a new field
-   entry unless it's one of the known modifier keywords."
-  (let ((entries '()) (current nil))
+(defun %soql-order-by-text (toks)
+  (let (entries)
     (dolist (tok toks)
-      (if (member (symbol-name tok) *soql-order-modifiers* :test #'string=)
-          (push tok current)
-          (progn
-            (when current (push (nreverse current) entries))
-            (setf current (list tok)))))
-    (when current (push (nreverse current) entries))
-    (%soql-interpose
-     (mapcar (lambda (entry) (%soql-lit (format nil "~{~A~^ ~}" (mapcar #'symbol-name entry))))
-             (nreverse entries))
-     ", ")))
+      (if (and entries (symbolp tok)
+               (member (symbol-name tok) '("ASC" "DESC" "NULLS" "FIRST" "LAST")
+                       :test #'string-equal))
+          (setf (car entries) (format nil "~A ~A" (car entries) (symbol-name tok)))
+          (push (%soql-item tok) entries)))
+    (format nil "~{~A~^, ~}" (nreverse entries))))
 
-(defun %soql-compile-with-tokens (toks)
-  "Generic recursive passthrough for WITH — bare keywords (SECURITY_ENFORCED,
-   USER_MODE) and nested structured forms (DATA CATEGORY ...) alike."
+(defun %soql-passthrough-text (toks)
+  "WITH / SET OPTIONS arguments: words as-is, a list as \"(a, b)\"."
+  (format nil "~{~A~^ ~}"
+          (mapcar (lambda (tok)
+                    (if (consp tok)
+                        (format nil "(~{~A~^, ~})" (mapcar #'%soql-word tok))
+                        (%soql-word tok)))
+                  toks)))
+
+(defun %soql-set-options-text (toks)
+  "SET OPTIONS (name = value ...) -> \"SET OPTIONS (name = value, ...)\"."
+  (let ((opts (first toks)))
+    (unless (and (consp opts) (null (cdr toks)) (zerop (mod (length opts) 3)))
+      (error "cl-sf: SET OPTIONS takes one list of name = value triples"))
+    (format nil "SET OPTIONS (~{~A~^, ~})"
+            (loop for (n eq v) on opts by #'cdddr
+                  collect (format nil "~A ~A ~A" (%soql-word n) (%soql-word eq) (%soql-word v))))))
+
+(defun %soql-single-token (kw toks)
+  (unless (and toks (null (cdr toks)))
+    (error "cl-sf: ~A takes exactly one argument, got ~S" kw toks))
+  (first toks))
+
+(defun %soql-compile-clause (kw toks env)
+  (flet ((text (fmt &rest args) (list (apply #'format nil fmt args))))
+    (cond
+      ((string= kw "SELECT")   (%soql-cat (list "SELECT ") (%soql-compile-select-list toks env)))
+      ((string= kw "FROM")     (text "FROM ~{~A~^ ~}" (mapcar #'%soql-word toks)))
+      ((string= kw "USING SCOPE") (text "USING SCOPE ~A" (%soql-word (%soql-single-token kw toks))))
+      ((string= kw "WHERE")    (%soql-cat '("WHERE ")  (%soql-compile-condition toks env)))
+      ((string= kw "HAVING")   (%soql-cat '("HAVING ") (%soql-compile-condition toks env)))
+      ((string= kw "WITH")     (text "WITH ~A" (%soql-passthrough-text toks)))
+      ((string= kw "GROUP BY") (text "GROUP BY ~{~A~^, ~}" (mapcar #'%soql-item toks)))
+      ((string= kw "ORDER BY") (text "ORDER BY ~A" (%soql-order-by-text toks)))
+      ((string= kw "LIMIT")    (%soql-cat '("LIMIT ")  (%soql-value (%soql-single-token kw toks) env)))
+      ((string= kw "OFFSET")   (%soql-cat '("OFFSET ") (%soql-value (%soql-single-token kw toks) env)))
+      ((string= kw "FOR")      (text "FOR ~A" (%soql-word (%soql-single-token kw toks))))
+      ((string= kw "UPDATE")   (text "UPDATE ~A" (%soql-word (%soql-single-token kw toks))))
+      ((string= kw "SET OPTIONS") (list (%soql-set-options-text toks)))
+      (t (error "cl-sf: unknown SOQL clause ~A" kw)))))
+
+(defun %soql-clause-at (toks)
+  "If TOKS starts a top-level clause, return (values keyword-string
+   keyword-width-in-tokens takes-one-argument-token-p)."
+  (let ((a (first toks)) (b (second toks)))
+    (flet ((kw (x name) (%soql-kw= x name))
+           (one (name) (values name 1 nil)))
+      (cond
+        ((kw a "FROM")  (values "FROM" 1 t))
+        ((kw a "WHERE")  (one "WHERE"))
+        ((kw a "WITH")   (one "WITH"))
+        ((kw a "HAVING") (one "HAVING"))
+        ((kw a "LIMIT")  (one "LIMIT"))
+        ((kw a "OFFSET") (one "OFFSET"))
+        ((and (kw a "USING") (kw b "SCOPE")) (values "USING SCOPE" 2 nil))
+        ((and (kw a "GROUP") (kw b "BY"))    (values "GROUP BY" 2 nil))
+        ((and (kw a "ORDER") (kw b "BY"))    (values "ORDER BY" 2 nil))
+        ((and (kw a "SET") (kw b "OPTIONS")) (values "SET OPTIONS" 2 nil))
+        ((and (kw a "FOR") (or (kw b "VIEW") (kw b "REFERENCE") (kw b "UPDATE")))
+         (values "FOR" 1 t))
+        ((and (kw a "UPDATE") (or (kw b "TRACKING") (kw b "VIEWSTAT")))
+         (values "UPDATE" 1 t))))))
+
+(defun %soql-split-clauses (toks)
+  "TOKS (everything after the implied SELECT) -> ((\"SELECT\" . tokens)
+   (\"FROM\" . tokens) ...) in source order.  Two-word keywords are matched
+   as pairs, and the token after FROM is always the object type, so an
+   sObject named Order or Group can't be mistaken for a clause."
+  (let ((clauses (list (list "SELECT"))))
+    (loop while toks
+          do (multiple-value-bind (kw width arg-p) (%soql-clause-at toks)
+               (cond (kw (push (list kw) clauses)
+                         (setf toks (nthcdr width toks))
+                         (when arg-p (push (pop toks) (cdr (first clauses)))))
+                     (t (push (pop toks) (cdr (first clauses)))))))
+    (mapcar (lambda (c) (cons (car c) (reverse (cdr c)))) (nreverse clauses))))
+
+(defun %soql-compile-query (toks env)
+  "TOKS — a query after its implied SELECT.  Returns a flat piece list; used
+   for the top-level query and for nested subqueries."
   (%soql-interpose
-   (mapcar (lambda (tok)
-             (if (symbolp tok)
-                 (%soql-lit (symbol-name tok))
-                 (%soql-cat '("(") (%soql-compile-with-tokens tok) '(")"))))
-           toks)
+   (loop for (kw . ctoks) in (%soql-split-clauses toks)
+         collect (%soql-compile-clause kw ctoks env))
    " "))
 
-(defun %soql-compile-clause (kw toks env &optional from-type)
-  (cond
-    ((string= kw "SELECT") (%soql-cat '("SELECT ") (%soql-compile-field-list toks env from-type)))
-    ((string= kw "FROM")   (%soql-cat '("FROM ") (%soql-interpose
-                                                  (mapcar (lambda (s) (%soql-lit (symbol-name s))) toks)
-                                                  ", ")))
-    ((string= kw "WHERE")  (%soql-cat '("WHERE ")  (%soql-compile-condition (first toks) env)))
-    ((string= kw "HAVING") (%soql-cat '("HAVING ") (%soql-compile-condition (first toks) env)))
-    ((string= kw "GROUP")  (%soql-cat '("GROUP BY ") (%soql-compile-group-by toks env)))
-    ((string= kw "ORDER")  (%soql-cat '("ORDER BY ") (%soql-compile-order-by toks)))
-    ((string= kw "LIMIT")  (%soql-cat '("LIMIT ")  (%soql-compile-value (first toks) env)))
-    ((string= kw "OFFSET") (%soql-cat '("OFFSET ") (%soql-compile-value (first toks) env)))
-    ((string= kw "FOR")    (%soql-cat '("FOR ")    (%soql-lit (symbol-name (first toks)))))
-    ((string= kw "UPDATE") (%soql-cat '("UPDATE ") (%soql-lit (symbol-name (first toks)))))
-    ((string= kw "USING")  (%soql-cat '("USING SCOPE ") (%soql-lit (symbol-name (first toks)))))
-    ((string= kw "WITH")   (%soql-cat '("WITH ")   (%soql-compile-with-tokens toks)))
-    (t (error "cl-sf: unknown SOQL clause ~A" kw))))
-
-(defun %soql-compile-query (body env)
-  "BODY is a flat clause-token list, e.g. (SELECT Id FROM Account WHERE ...).
-   Returns a flat piece list for the whole query (no surrounding parens) —
-   used both for the top-level SOQL macro and for nested subqueries.
-   The FROM clause's (single, literal) type token is threaded through to
-   SELECT so a bare * there knows what to DESCRIBE-SOBJECT."
-  (let* ((clauses   (%soql-split-clauses body))
-         (from-toks (cdr (assoc "FROM" clauses :test #'string=)))
-         (from-type (and from-toks (= (length from-toks) 1) (symbolp (first from-toks))
-                         (symbol-name (first from-toks)))))
-    (%soql-interpose
-     (loop for (kw . toks) in clauses
-           collect (%soql-compile-clause kw toks env from-type))
-     " ")))
-
-(defmacro soql (&body clauses &environment env)
-  "Build a SOQL query string from Apex-like s-expression syntax.
-   See the architecture comment above this macro for the full grammar.
-   Expands to a literal string at compile time when fully static (the
-   common case); a value position (comparison RHS, LIMIT, an IN-list
-   element) only defers to runtime when it's actually a variable — see
-   %SOQL-VARIABLE-P — so (let ((revenue ...)) (soql ... (> AnnualRevenue
-   revenue))) just works, with no (VAL ...) needed.
-
-   Example:
-     (let ((min-revenue 1000000))
-       (soql SELECT Id Name CreatedBy.Name
-             FROM Account
-             WHERE (AND (> AnnualRevenue min-revenue)
-                        (= Industry \"Technology\"))
-             ORDER BY Name ASC
-             LIMIT 10))"
-  (let ((pieces (%soql-compile-query clauses env)))
+(defun %soql-string (toks env)
+  "A form that evaluates to the query text for TOKS (a constant string when
+   nothing in it is a runtime value)."
+  (let ((pieces (%soql-compile-query toks env)))
     (if (every #'stringp pieces)
         (apply #'concatenate 'string pieces)
         `(concatenate 'string ,@pieces))))
 
+(defmacro soql (&body clauses &environment env)
+  "The SOQL text SELECT would run, without running it — for debugging and
+   for tests that shouldn't touch the network.  Same syntax as SELECT, but
+   written with its leading SELECT keyword, like the SOQL itself:
+     (soql SELECT Id FROM Account WHERE Name = \"Acme\")"
+  (unless (%soql-kw= (car clauses) "SELECT")
+    (error "cl-sf: SOQL must start with SELECT"))
+  (%soql-string (cdr clauses) env))
+
 ;;; ──────────────────────────────────────────────────────────────────
-;;; Public API — SOQL
+;;; Public API — SELECT
 ;;; ──────────────────────────────────────────────────────────────────
 
-(defun query (soql &key (conn *connection*))
-  "Execute a SOQL query and return a LAZY-RESULT-SET of SOBJECT instances.
-   Pagination is transparent — iterate with DO-RECORDS or force with COLLECT-ALL.
-   CONN defaults to *CONNECTION* (see WITH-CONN).
+(defun %select (soql all-rows)
+  "Run SOQL on *CONNECTION*, fetching every page.  Returns a SIMPLE-VECTOR
+   of SOBJECTs."
+  (let ((conn *connection*))
+    (cl-sf/api::%query-records conn soql
+                               :all all-rows
+                               :coercer (lambda (h) (hash->sobject h nil conn)))))
 
-   Example:
+(defmacro select (&body clauses &environment env)
+  "Run a SOQL query on *CONNECTION* (see WITH-CONN) and return every
+   matching record, all pages fetched, as a SIMPLE-VECTOR of SOBJECTs.
+   Syntax: SOQL itself with the leading SELECT implied and no commas — see
+   the grammar above.  A trailing ALL ROWS includes deleted/archived rows.
+
+   Examples:
      (with-conn \"myorg\"
-       (do-records (acct \"SELECT Id, Name FROM Account WHERE AnnualRevenue > 1000000\")
-         (format t \"~A~%\" (account-name acct))))"
-  (make-lazy-result-set conn
-                        (cl-sf/api::%query conn soql)
-                        :record-coercer (lambda (h) (hash->sobject h nil conn))))
+       (let ((min-revenue 1000000))
+         (select Id Name
+                 FROM Account
+                 WHERE AnnualRevenue > min-revenue AND Industry IN (\"Tech\" \"Finance\")
+                 ORDER BY Name
+                 LIMIT 10)))
 
-(defun query-all (soql &key (conn *connection*))
-  "Like QUERY but includes soft-deleted (archived) records via /queryAll."
-  (make-lazy-result-set conn
-                        (cl-sf/api::%query-all conn soql)
-                        :record-coercer (lambda (h) (hash->sobject h nil conn))))
+     (select (COUNT Id) n Industry FROM Account GROUP BY Industry)
+     (select Id FROM Account WHERE Name = \"Acme\" ALL ROWS)"
+  (let* ((all-rows (and (cdr clauses)
+                        (%soql-kw= (car (last clauses 2)) "ALL")
+                        (%soql-kw= (car (last clauses)) "ROWS")))
+         (toks     (if all-rows (butlast clauses 2) clauses)))
+    `(%select ,(%soql-string toks env) ,all-rows)))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; SELECT ... FROM a JOIN b ON ... — SQL-style client-side joins
-;;;
-;;; SOQL's FROM is one object; there's no cross-object JOIN.  This is cl-sf
-;;; sugar layered on top of SELECT: each table gets its own independent
-;;; SELECT * query, and the JOINs run in Lisp against the results — exactly
-;;; what SOBJECT-JOIN does by hand, but driven by SQL-shaped syntax so a
-;;; multi-table lookup chain reads the way it would in SQL:
-;;;
-;;;   (select c.CustomerName c.CreditScore cr.RiskTier
-;;;           FROM Customers c
-;;;           JOIN CreditRiskTiers cr ON (BETWEEN c.CreditScore cr.MinScore cr.MaxScore))
-;;;
-;;; Grammar once a JOIN token appears anywhere in the clause list:
-;;;   (field.alias... FROM type alias
-;;;     ([LEFT|RIGHT|FULL|INNER] [OUTER] JOIN type alias ON condition)*)
-;;;   SELECT fields    — ALIAS.FIELD only (no bare fields — once >1 table
-;;;                       is in play every field needs to say which one)
-;;;   FROM/JOIN alias  — a short name bound to that table's matched record
-;;;   JOIN kind        — plain JOIN/INNER JOIN (default) drops unmatched
-;;;                       rows on both sides; LEFT/RIGHT keep every row on
-;;;                       that side at least once (unmatched columns on
-;;;                       the other side come back NIL); FULL keeps both.
-;;;                       OUTER is accepted after LEFT/RIGHT/FULL and
-;;;                       ignored, same as SQL.
-;;;   ON condition     — (AND c...) (OR c...) (NOT c)
-;;;                       (op ALIAS.FIELD-or-literal ALIAS.FIELD-or-literal)
-;;;                         op is = != < <= > >=
-;;;                       (BETWEEN v lo hi)
-;;;                       (LIKE field pattern) — pattern may be
-;;;                         (CONCAT part...), SQL's `a || '%'` as a
-;;;                         Lisp form instead of a string-concat operator
-;;;                       Each operand may also be (VAL lisp-expr).
-;;;   A later JOIN's ON may reference ANY earlier alias, not just the one
-;;;   immediately before it (the "regional_commission_tiers" pattern:
-;;;   joining on fields from both the base table and the first JOIN) —
-;;;   including an alias an earlier LEFT/RIGHT/FULL join left unmatched,
-;;;   which just makes every comparison against it NIL (no match), same
-;;;   as SQL chaining an INNER JOIN after a LEFT JOIN.
-;;;   Every alias referenced in SELECT or an ON condition is checked
-;;;   against the known FROM/JOIN aliases at macroexpansion time — an
-;;;   unknown alias is a compile-time error, not a silent runtime NIL.
-;;;
-;;; Every table (FROM and each JOIN) is fetched in parallel via
-;;; LPARALLEL:FUTURE before any join runs — they're independent queries,
-;;; so there's no reason to pay N round-trips serially.
-;;; ponytail: every joined table is fetched with SELECT * (simplest —
-;;; avoids working out which fields each step's ON/output actually needs);
-;;; narrow this with a (FIELDS ...) escape per table if DESCRIBE-SOBJECT's
-;;; full field list becomes the bottleneck.
-;;; ponytail: each JOIN step is still O(current-rows * new-table-size) — no
-;;; equality key to hash on from an arbitrary ON condition — but %JOIN-STEP
-;;; dispatches to LPARALLEL above *JOIN-PARALLEL-THRESHOLD* pairs, which
-;;; benchmarked at 6-7x past the first ~1M pairs (see %NESTED-LOOP-JOIN).
-;;; An ON condition that's a single alias.field = alias.field equality is
-;;; exactly what SOBJECT-JOIN's hash-join path optimizes instead (O(n+m),
-;;; no nested loop at all); drop to it directly (:left-key/:right-key) if
-;;; a join step here is still the bottleneck.
+;;; Nested-loop join engine (backs SOBJECT-JOIN's :TEST path)
 ;;; ──────────────────────────────────────────────────────────────────
-
-(defun %split-alias-path (sym)
-  "Split SYM's name (e.g. C.CREDITSCORE, read upcased by the reader) into
-   (values alias-string field-name-string) on the first dot."
-  (let* ((name (symbol-name sym))
-         (dot  (position #\. name)))
-    (unless dot
-      (error "cl-sf: JOIN path ~S is not ALIAS.FIELD" sym))
-    (values (subseq name 0 dot) (subseq name (1+ dot)))))
-
-(defun %ci-gethash (key hash)
-  "Case-insensitive lookup in HASH (a SOBJECT-RAW response table, whose
-   keys are Salesforce's own-cased field names) — needed because ALIAS.
-   FIELD tokens arrive as Lisp symbols, always upcased by the reader.
-   Returns (values value real-key found-p).  A JSON null field comes back
-   from COM.INUOE.JZON:PARSE as the symbol CL:NULL, not NIL — normalized
-   to NIL here so every caller's ordinary null-check (AND, NULL, etc.)
-   actually catches an absent/null field, not just a missing key.
-   ponytail: O(field count) per lookup via linear scan; fine for
-   sObject-sized field lists (tens, not thousands)."
-  (loop for k being the hash-keys of hash using (hash-value v)
-        when (string-equal k key)
-          do (return-from %ci-gethash (values (unless (eq v 'null) v) k t)))
-  (values nil nil nil))
-
-(defun %join-field-value (alias field-name row candidate current-alias)
-  "Resolve ALIAS.FIELD-NAME at JOIN-step runtime: CANDIDATE if ALIAS is
-   the table being matched in this step, else look it up in ROW (the
-   alist of every earlier alias's matched record for this chain).
-   ALIAS is assumed valid — %VALIDATE-JOIN-ALIASES already checked that at
-   macroexpansion time — so a missing entry here just means an outer join
-   left this alias unmatched for this row, i.e. a NULL column, not an error."
-  (let ((record (if (string= alias current-alias)
-                     candidate
-                     (cdr (assoc alias row :test #'string=)))))
-    (when record (nth-value 0 (%ci-gethash field-name (sobject-raw record))))))
-
-(defun %join-row-field-value (alias field-name row)
-  "Resolve ALIAS.FIELD-NAME for the final SELECT projection, against a
-   fully-joined ROW (alist of every alias's matched record).  See
-   %JOIN-FIELD-VALUE on why a missing alias resolves to NIL, not an error."
-  (let ((record (cdr (assoc alias row :test #'string=))))
-    (if record (%ci-gethash field-name (sobject-raw record)) (values nil nil nil))))
-
-(defun %joined-field-value (obj alias field)
-  "Look up a joined-in field by ALIAS and FIELD in OBJ's SOBJECT-RAW,
-   under the \"ALIAS.Field\" key %PROJECT-JOIN-ROW stores it as — matched
-   case-insensitively on both parts, since the real field's casing comes
-   from Salesforce's own response, not from how ALIAS/FIELD were spelled
-   in the SELECT list.  Backs the per-join accessor functions generated
-   by %EXPAND-SELECT-JOIN (e.g. CONTACT-USER-NAME)."
-  (let ((raw (sobject-raw obj)))
-    (when raw
-      (loop for k being the hash-keys of raw using (hash-value v)
-            for dot = (position #\. k)
-            when (and dot
-                      (string-equal (subseq k 0 dot) alias)
-                      (string-equal (subseq k (1+ dot)) field))
-              do (return v)))))
-
-(defun %join-compare (op a b)
-  "Compare A and B by OP (:= :/= :< :<= :> :>=) — numerically if both are
-   numbers, else lexicographically on their string form (Salesforce Id/
-   lookup fields are strings).  NIL if either side is NIL (unmatched/absent
-   field never satisfies a JOIN condition)."
-  (when (and a b)
-    (if (and (numberp a) (numberp b))
-        (ecase op (:= (= a b)) (:/= (/= a b))
-               (:< (< a b)) (:<= (<= a b)) (:> (> a b)) (:>= (>= a b)))
-        (let ((a (princ-to-string a)) (b (princ-to-string b)))
-          (ecase op
-            (:=  (string= a b)) (:/= (not (string= a b)))
-            (:<  (string< a b)) (:<= (not (string< b a)))
-            (:>  (string> a b)) (:>= (not (string< a b))))))))
-
-(defun %between-p (v lo hi)
-  "T if LO <= V <= HI — numerically if all three are numbers, else
-   lexicographically on string form."
-  (when (and v lo hi)
-    (if (and (numberp v) (numberp lo) (numberp hi))
-        (and (>= v lo) (<= v hi))
-        (let ((v (princ-to-string v)) (lo (princ-to-string lo)) (hi (princ-to-string hi)))
-          (and (not (string< v lo)) (not (string< hi v)))))))
-
-(defun %like->regex (pattern)
-  "Convert a SQL/SOQL LIKE pattern (% = any run of characters, _ = any
-   one character) to an anchored CL-PPCRE regex."
-  (format nil "^~A$"
-          (with-output-to-string (out)
-            (loop for c across pattern
-                  do (case c
-                       (#\% (write-string ".*" out))
-                       (#\_ (write-string "." out))
-                       ((#\. #\\ #\( #\) #\[ #\] #\{ #\} #\+ #\* #\? #\^ #\$ #\|)
-                        (write-char #\\ out) (write-char c out))
-                       (t (write-char c out)))))))
-
-(defun %join-resolve-value-form (val current-alias)
-  "Compile one ON-condition operand (macro-expansion time) into a runtime
-   form evaluated against ROW/CANDIDATE — an ALIAS.FIELD path, a literal,
-   (VAL expr), or (CONCAT part...) (SQL's a || b || '%', as a Lisp form)."
-  (cond
-    ((%soql-kw= (and (consp val) (first val)) "VAL") (second val))
-    ((and (consp val) (%soql-kw= (first val) "CONCAT"))
-     `(concatenate 'string
-                    ,@(mapcar (lambda (p) `(princ-to-string ,(%join-resolve-value-form p current-alias)))
-                              (rest val))))
-    ((and (symbolp val) (find #\. (symbol-name val)))
-     (multiple-value-bind (alias field) (%split-alias-path val)
-       `(%join-field-value ,alias ,field row candidate ,current-alias)))
-    ((symbolp val) (symbol-name val))
-    ((stringp val) val)
-    ((numberp val) val)
-    (t (error "cl-sf: malformed JOIN condition operand ~S" val))))
-
-(defparameter *join-comparison-ops*
-  '(("=" . :=) ("!=" . :/=) ("<" . :<) ("<=" . :<=) (">" . :>) (">=" . :>=)))
-
-(defun %compile-join-condition (cond-form current-alias)
-  "Compile an ON-condition s-expression (macro-expansion time) into a
-   runtime form — see the grammar comment above this section."
-  (let* ((head (string-upcase (symbol-name (first cond-form))))
-         (op   (assoc head *join-comparison-ops* :test #'string=)))
-    (cond
-      ((string= head "AND")
-       `(and ,@(mapcar (lambda (c) (%compile-join-condition c current-alias)) (rest cond-form))))
-      ((string= head "OR")
-       `(or ,@(mapcar (lambda (c) (%compile-join-condition c current-alias)) (rest cond-form))))
-      ((string= head "NOT")
-       `(not ,(%compile-join-condition (second cond-form) current-alias)))
-      (op
-       (destructuring-bind (a b) (rest cond-form)
-         `(%join-compare ,(cdr op)
-                          ,(%join-resolve-value-form a current-alias)
-                          ,(%join-resolve-value-form b current-alias))))
-      ((string= head "BETWEEN")
-       (destructuring-bind (v lo hi) (rest cond-form)
-         `(%between-p ,(%join-resolve-value-form v current-alias)
-                       ,(%join-resolve-value-form lo current-alias)
-                       ,(%join-resolve-value-form hi current-alias))))
-      ((string= head "LIKE")
-       (destructuring-bind (field pattern) (rest cond-form)
-         `(let ((s ,(%join-resolve-value-form field current-alias)))
-            (and s (cl-ppcre:scan (%like->regex ,(%join-resolve-value-form pattern current-alias)) s)))))
-      (t (error "cl-sf: unknown JOIN condition operator ~S" (first cond-form))))))
 
 (defparameter *join-parallel-threshold* 20000
   "LEFT-count * RIGHT-count above which a nested-loop join (%NESTED-LOOP-
-   JOIN, used by %JOIN-STEP and SOBJECT-JOIN's :TEST path) switches from
+   JOIN, used by SOBJECT-JOIN's :TEST path) switches from
    a sequential double loop to LPARALLEL:PMAPCAR chunked by LEFT row.
    Benchmarked: dispatch overhead loses below ~10k row*candidate pairs,
    wins 6-7x by ~1M pairs and up — this sits just above the loss zone.")
@@ -1021,281 +818,6 @@
                  #'%nested-loop-join/sequential)
              left-list right-list condition-fn pair-fn type)))
 
-(defun %join-step (accumulated-rows new-records new-alias condition-fn type)
-  "Join ACCUMULATED-ROWS (list of alias->record alists) against
-   NEW-RECORDS under NEW-ALIAS.  CONDITION-FN is (lambda (row candidate)
-   boolean).  See %NESTED-LOOP-JOIN, which this dispatches to.
-
-   TYPE — :inner (default; unmatched rows on either side drop), :left
-   (every ACCUMULATED-ROWS row survives at least once — NEW-ALIAS absent,
-   i.e. NIL fields, when unmatched), :right (every NEW-RECORDS record
-   survives at least once — no earlier alias present, i.e. NIL fields,
-   when unmatched), :full (both)."
-  (%nested-loop-join accumulated-rows new-records condition-fn
-                      (lambda (row candidate)
-                        (cond ((and row candidate) (cons (cons new-alias candidate) row))
-                              (candidate (list (cons new-alias candidate)))
-                              (t row)))
-                      type))
-
-(defun %project-join-row (row select-fields base-alias base-type)
-  "Build one output SOBJECT for ROW (alist of alias->record) from the
-   ALIAS.FIELD SELECT-FIELDS tokens.  Routed through HASH->SOBJECT with
-   BASE-TYPE as the hint, exactly like any ordinary query result — so the
-   row comes back as a genuinely-typed instance, with slots populated
-   only for the BASE-ALIAS fields actually selected (same as a plain,
-   non-JOIN SELECT only ever returning the fields it asked for — the
-   underlying per-table fetches pull every field so the join engine and
-   any ON condition can match on them, but that's an internal fetch
-   detail, not something the final projected row should expose).
-
-   BASE-ALIAS's own selected fields are stored under their real field
-   name; every other alias's fields are stored under an alias-qualified
-   key (\"ALIAS.Field\", e.g. \"U.Name\") instead of the bare field name —
-   a joined table can share a field name with the base type itself
-   (Contact has its own \"Name\" field, distinct from a joined User's
-   \"Name\"), and a bare-keyed merge would make one silently shadow the
-   other.  The alias-qualified key also guarantees a joined field can
-   never land in the base type's own registered slot map, so it can
-   never leak into SOBJECT->HASH-TABLE / bulk serialization either.
-   Backs the per-join accessor functions %JOIN-ACCESSOR-DEFUNS generates
-   (e.g. CONTACT-USER-NAME), via %JOINED-FIELD-VALUE.
-
-   A ROW missing BASE-ALIAS entirely (a RIGHT/FULL OUTER JOIN whose base
-   side went unmatched) just means every base-alias field below resolves
-   to NIL — no special-casing needed."
-  (let ((out (make-hash-table :test #'equal)))
-    (dolist (tok select-fields)
-      (multiple-value-bind (alias field) (%split-alias-path tok)
-        (multiple-value-bind (val real-key) (%join-row-field-value alias field row)
-          (let ((key (or real-key field)))
-            (setf (gethash (if (string= alias base-alias) key (format nil "~A.~A" alias key)) out)
-                  val)))))
-    (hash->sobject out base-type *connection*)))
-
-(defun %collect-condition-paths (form)
-  "Collect every ALIAS.FIELD symbol appearing anywhere in a (possibly
-   nested AND/OR/NOT/BETWEEN/LIKE/CONCAT/VAL) ON-condition form — used to
-   validate every alias referenced actually exists in the JOIN chain."
-  (cond
-    ((and (symbolp form) (find #\. (symbol-name form))) (list form))
-    ((consp form) (mapcan #'%collect-condition-paths form))
-    (t nil)))
-
-(defun %validate-join-aliases (select-fields joins base-alias)
-  "Error at macroexpansion time if SELECT or any ON condition references
-   an alias that isn't FROM's or one of JOINS' — a typo here should fail
-   loudly, not silently resolve to NIL the way an outer join's genuinely
-   unmatched side does at runtime (see %JOIN-FIELD-VALUE)."
-  (let ((known (cons base-alias (mapcar (lambda (j) (symbol-name (second j))) joins))))
-    (flet ((check (sym)
-             (multiple-value-bind (alias field) (%split-alias-path sym)
-               (declare (ignore field))
-               (unless (member alias known :test #'string=)
-                 (error "cl-sf: JOIN references unknown alias ~S (known: ~{~A~^, ~})" alias known)))))
-      (mapc #'check select-fields)
-      (dolist (j joins)
-        (mapc #'check (%collect-condition-paths (third j)))))))
-
-(defparameter *join-kind-keywords* '("LEFT" "RIGHT" "FULL" "INNER"))
-
-(defun %join-kind-from-keyword (kw)
-  (cond ((string= kw "LEFT") :left) ((string= kw "RIGHT") :right)
-        ((string= kw "FULL") :full) (t :inner)))
-
-(defun %join-starter-p (tok)
-  "T if TOK begins the next JOIN clause (JOIN itself, or a join-kind
-   prefix like LEFT/RIGHT/FULL/INNER) rather than being an alias — used to
-   detect that a table had no explicit alias token."
-  (and (symbolp tok)
-       (or (%soql-kw= tok "JOIN")
-           (member (symbol-name tok) *join-kind-keywords* :test #'string=))))
-
-(defun %pop-type-and-alias (tokens no-alias-p)
-  "Pop a (type [alias]) pair from the front of TOKENS.  NO-ALIAS-P tests
-   whether the token right after TYPE actually starts something else (ON,
-   or the next JOIN clause) — if so, there's no alias, and it defaults to
-   TYPE itself.  Returns (values type alias remaining-tokens)."
-  (let* ((type   (first tokens))
-         (tokens (rest tokens)))
-    (if (and tokens (not (funcall no-alias-p (first tokens))))
-        (values type (first tokens) (rest tokens))
-        (values type type tokens))))
-
-(defun %parse-join-select (clauses)
-  "Parse (field.alias... FROM type [alias]
-           ([LEFT|RIGHT|FULL|INNER] [OUTER] JOIN type [alias] ON cond)*)
-   into (values select-fields (from-type . from-alias) join-specs), where
-   JOIN-SPECS is a list of (type alias condition kind) — KIND is :inner
-   (plain JOIN, the default), :left, :right, or :full.
-
-   ALIAS is optional on both FROM and each JOIN — when omitted, it
-   defaults to the table name itself (so FROM User JOIN Contact ON
-   (= User.Id Contact.OwnerId) works with no c/u aliases at all) — see
-   %POP-TYPE-AND-ALIAS."
-  (let ((from-pos (position-if (lambda (c) (%soql-kw= c "FROM")) clauses)))
-    (unless from-pos (error "cl-sf: JOIN select requires FROM"))
-    (let ((select-fields (subseq clauses 0 from-pos)))
-      (multiple-value-bind (from-type from-alias tokens)
-          (%pop-type-and-alias (subseq clauses (1+ from-pos)) #'%join-starter-p)
-        (let ((joins '()))
-          (loop while tokens
-                do (let ((kind :inner))
-                     (when (member (symbol-name (first tokens)) *join-kind-keywords* :test #'string=)
-                       (setf kind (%join-kind-from-keyword (symbol-name (pop tokens))))
-                       (when (and tokens (%soql-kw= (first tokens) "OUTER"))
-                         (pop tokens)))
-                     (unless (%soql-kw= (pop tokens) "JOIN")
-                       (error "cl-sf: expected JOIN"))
-                     (multiple-value-bind (jtype jalias remaining)
-                         (%pop-type-and-alias tokens (lambda (tok) (%soql-kw= tok "ON")))
-                       (setf tokens remaining)
-                       (unless (%soql-kw= (pop tokens) "ON")
-                         (error "cl-sf: expected ON"))
-                       (push (list jtype jalias (pop tokens) kind) joins))))
-          (values select-fields (cons from-type from-alias) (nreverse joins)))))))
-
-(defun %join-accessor-defuns (select-fields from joins)
-  "Build one DEFUN form per joined (non-base) ALIAS.FIELD token in
-   SELECT-FIELDS, named <base-type>-<joined-type>-<field> (e.g.
-   CONTACT-USER-NAME) and backed by %JOINED-FIELD-VALUE — so a joined
-   field reads like any native sObject accessor, not just via SOBJECT-RAW.
-   Interned into *PACKAGE* at macroexpansion time, same convention
-   DEFINE-SOBJECT-CLASS uses for native accessors.
-
-   Only one alias per joined type is assumed — joining the same type
-   twice under different aliases (a self-join) would make both aliases'
-   accessor defuns collide on the same name; reach into SOBJECT-RAW's
-   \"ALIAS.Field\" keys directly for that rare case instead."
-  (let* ((base-alias (symbol-name (cdr from)))
-         (base-type  (symbol-name (car from)))
-         (alias-types (cons (cons base-alias base-type)
-                             (mapcar (lambda (j) (cons (symbol-name (second j)) (symbol-name (first j))))
-                                     joins)))
-         (seen (make-hash-table :test #'equal)))
-    (loop for tok in select-fields
-          nconc (multiple-value-bind (alias field) (%split-alias-path tok)
-                  (unless (string= alias base-alias)
-                    (let* ((joined-type (cdr (assoc alias alias-types :test #'string=)))
-                           (name (format nil "~A-~A-~A" base-type joined-type field)))
-                      (unless (gethash name seen)
-                        (setf (gethash name seen) t)
-                        (list `(defun ,(intern name) (obj)
-                                 (%joined-field-value obj ,alias ,field))))))))))
-
-(defun %expand-select-join (clauses)
-  "Macro-expansion-time compiler for the SELECT ... FROM a JOIN b ON ...
-   path — see the grammar comment above this section.  Every table is
-   fetched in parallel via LPARALLEL:FUTURE before any join runs — they're
-   independent queries, no reason to serialize network-bound fetches —
-   then joins run in order against the already-fetched record lists."
-  (multiple-value-bind (select-fields from joins) (%parse-join-select clauses)
-    ;; Id is needed to later UPDATE/DELETE/UPSERT a projected row, and is
-    ;; easy to forget to select explicitly — add BASE-ALIAS.Id up front
-    ;; unless it (or some case variant of it) is already there.  Only the
-    ;; base alias gets this: the projected row's SOBJECT-ID comes from its
-    ;; own Id, not a joined table's.
-    (let ((base-alias (symbol-name (cdr from))))
-      (unless (some (lambda (tok)
-                      (multiple-value-bind (alias field) (%split-alias-path tok)
-                        (and (string= alias base-alias) (string-equal field "ID"))))
-                    select-fields)
-        (setf select-fields (cons (intern (format nil "~A.ID" base-alias)) select-fields))))
-    (%validate-join-aliases select-fields joins (symbol-name (cdr from)))
-    (let ((rows-sym      (gensym "ROWS"))
-          (conn-sym      (gensym "CONN"))
-          (base-fut-sym  (gensym "BASEFUT"))
-          (join-fut-syms (mapcar (lambda (j) (declare (ignore j)) (gensym "JOINFUT")) joins)))
-      ;; CONN-SYM captures *CONNECTION* on THIS (calling) thread, before any
-      ;; LPARALLEL:FUTURE is spawned, and each future body rebinds
-      ;; *CONNECTION* to it explicitly.  LPARALLEL worker threads do NOT
-      ;; inherit the submitting thread's dynamic bindings automatically —
-      ;; without this, QUERY's and %SOQL-WILDCARD-FIELD-NAMES's own
-      ;; *CONNECTION* lookups would see its global default (NIL) inside the
-      ;; future, not the connection WITH-CONN bound on the calling thread.
-      `(progn
-         ,@(%join-accessor-defuns select-fields from joins)
-         (cl-sf/auth::%ensure-lparallel-kernel)
-         (let* ((,conn-sym     *connection*)
-                (,base-fut-sym (lparallel:future
-                                 (let ((*connection* ,conn-sym))
-                                   (collect-all (query (soql select * from ,(car from)))))))
-                ,@(loop for j in joins
-                        for fsym in join-fut-syms
-                        collect `(,fsym (lparallel:future
-                                          (let ((*connection* ,conn-sym))
-                                            (collect-all (query (soql select * from ,(first j))))))))
-                (,rows-sym (mapcar (lambda (r) (list (cons ,(symbol-name (cdr from)) r)))
-                                    (lparallel:force ,base-fut-sym))))
-           ,@(loop for j in joins
-                   for fsym in join-fut-syms
-                   for alias-str = (symbol-name (second j))
-                   collect `(setf ,rows-sym
-                                  (%join-step ,rows-sym
-                                              (lparallel:force ,fsym)
-                                              ,alias-str
-                                              (lambda (row candidate)
-                                                (declare (ignorable row candidate))
-                                                ,(%compile-join-condition (third j) alias-str))
-                                              ,(fourth j))))
-           (mapcar (lambda (row) (%project-join-row row ',select-fields
-                                                     ,(symbol-name (cdr from)) ,(symbol-name (car from))))
-                   ,rows-sym))))))
-
-(defmacro select (&body clauses)
-  "Compile CLAUSES via SOQL and immediately QUERY it — fuses the two steps
-   for the common case, so you're not required to go through DO-RECORDS.
-   CONN defaults to *CONNECTION*, same as QUERY.
-
-   Unlike SOQL, don't repeat the leading SELECT keyword — the macro name
-   already says so.  A trailing :LAZY keyword controls the return shape:
-
-   :LAZY T (default) — returns the LAZY-RESULT-SET QUERY would, a real
-                        CL:SEQUENCE: pages fetch on demand as you consume
-                        it via MAP, REDUCE, FIND, (LOOP ... BEING THE
-                        ELEMENTS OF ...), DO-RECORDS, COLLECT-ALL, etc.
-   :LAZY NIL          — fetches every page up front and returns a plain
-                        SIMPLE-VECTOR instead, for when you want an
-                        ordinary eager collection and don't care about
-                        deferring the network cost.
-
-   SOQL remains available on its own when you want just the compiled text
-   (debugging, testing without hitting the network, or feeding QUERY-ALL
-   instead of QUERY).
-
-   A JOIN token anywhere switches to the SQL-style multi-table path (see
-   the grammar comment above this macro) — SOQL can't express an arbitrary
-   cross-object JOIN, so each table is fetched independently and joined in
-   Lisp.  That path always returns an eager list of hash-tables (one per
-   joined row, keyed by field name) — :LAZY doesn't apply there.
-
-   Examples:
-     (with-conn \"myorg\"
-       (loop for acct being the elements of (select Id Name FROM Account)
-             collect (gethash \"Name\" (sobject-raw acct))))
-
-     (with-conn \"myorg\"
-       (select Id Name FROM Account WHERE (= Industry \"Tech\") :lazy nil))
-
-     (with-conn \"myorg\"
-       (select c.CustomerName cr.RiskTier
-               FROM Customers c
-               JOIN CreditRiskTiers cr ON (BETWEEN c.CreditScore cr.MinScore cr.MaxScore)))"
-  ;; Trailing :key value pairs (currently just :LAZY) are stripped once,
-  ;; upfront, before either path sees CLAUSES — the JOIN path doesn't
-  ;; accept any (it's always eager), but it must never be left holding a
-  ;; stray :LAZY NIL and mistaking it for the start of another JOIN clause.
-  (let* ((key-pos      (position-if #'keywordp clauses))
-         (soql-clauses (if key-pos (subseq clauses 0 key-pos) clauses))
-         (keys         (if key-pos (subseq clauses key-pos) nil)))
-    (if (some (lambda (c) (%soql-kw= c "JOIN")) soql-clauses)
-        (progn
-          (when keys (error "cl-sf: SELECT ... JOIN is always eager — :LAZY does not apply"))
-          (%expand-select-join soql-clauses))
-        (let ((rset-sym (gensym "RSET")))
-          (destructuring-bind (&key (lazy t)) keys
-            `(let ((,rset-sym (query (soql select ,@soql-clauses))))
-               (if ,lazy ,rset-sym (coerce (collect-all ,rset-sym) 'vector))))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Public API — sObject CRUD

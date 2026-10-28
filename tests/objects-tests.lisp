@@ -252,36 +252,136 @@
             "each sub-query record prints exactly as it would standalone"))))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; SOQL DSL — IN-list value forms, FIELDS escape, SELECT * wildcard
+;;; SELECT / SOQL — infix SOQL syntax compiled to text
 ;;; ──────────────────────────────────────────────────────────────────
 
-(define-test soql/in-quoted-literal-list
-  :parent objects
-  (is string= "SELECT ID FROM ACCOUNT WHERE STATUS IN ('A', 'B')"
-      (cl-sf/objects:soql select id from account where (in status '("A" "B")))))
+(defmacro soql= (expected &body clauses)
+  `(is string= ,expected (cl-sf/objects:soql ,@clauses)))
 
-(define-test soql/in-bound-variable-list
+(define-test soql/basic-clauses
+  :parent objects
+  (soql= "SELECT ID, NAME FROM ACCOUNT"
+         select id name from account)
+  (soql= "SELECT ID FROM ACCOUNT WHERE NAME = 'Acme' ORDER BY NAME DESC NULLS LAST, ID ASC LIMIT 10 OFFSET 5"
+         select id from account where name = "Acme"
+         order by name desc nulls last id asc limit 10 offset 5)
+  (soql= "SELECT ID FROM ACCOUNT FOR UPDATE"
+         select id from account for update)
+  (soql= "SELECT ID FROM ACCOUNT FOR VIEW UPDATE TRACKING"
+         select id from account for view update tracking))
+
+(define-test soql/where-boolean-logic
+  :parent objects
+  (soql= "SELECT ID FROM ACCOUNT WHERE (A = 1 AND B > 2)"
+         select id from account where a = 1 and b > 2)
+  (soql= "SELECT ID FROM ACCOUNT WHERE (A = 1 OR (B = 2 AND C = 3))"
+         select id from account where a = 1 or b = 2 and c = 3)
+  (soql= "SELECT ID FROM ACCOUNT WHERE ((A = 1 OR B = 2) AND NOT C LIKE 'x%')"
+         select id from account where (a = 1 or b = 2) and not c like "x%")
+  (soql= "SELECT ID FROM ACCOUNT WHERE (A != NULL AND B <> TRUE)"
+         select id from account where a != null and b <> true))
+
+(define-test soql/value-forms
+  :parent objects
+  (let ((name "O'Brien") (n 3))
+    (soql= "SELECT ID FROM ACCOUNT WHERE NAME = 'O\\'Brien'"
+           select id from account where name = name)
+    (soql= "SELECT ID FROM ACCOUNT WHERE (N > 6 AND M = 'x')"
+           select id from account where n > (* n 2) and m = "x")
+    (soql= "SELECT ID FROM ACCOUNT LIMIT 3"
+           select id from account limit n))
+  (soql= "SELECT ID FROM ACCOUNT WHERE D = LAST_N_DAYS:5"
+         select id from account where d = (raw "LAST_N_DAYS:5"))
+  (soql= "SELECT ID FROM ACCOUNT WHERE X = 1.5"
+         select id from account where x = 1.5))
+
+(define-test soql/in-lists
   :parent objects
   (let ((statuses (list "A" "B")))
-    (is string= "SELECT ID FROM ACCOUNT WHERE STATUS IN ('A', 'B')"
-        (cl-sf/objects:soql select id from account where (in status statuses)))))
+    (soql= "SELECT ID FROM ACCOUNT WHERE STATUS IN ('A', 'B')"
+           select id from account where status in ("A" "B"))
+    (soql= "SELECT ID FROM ACCOUNT WHERE STATUS IN ('A', 'B')"
+           select id from account where status in statuses)
+    (soql= "SELECT ID FROM ACCOUNT WHERE STATUS NOT IN ('A', 'B')"
+           select id from account where status not in (list "A" "B")))
+  (soql= "SELECT ID FROM ACCOUNT WHERE ID IN (SELECT ACCOUNTID FROM CONTACT WHERE X = 1)"
+         select id from account where id in (select accountid from contact where x = 1))
+  (soql= "SELECT ID FROM ACCOUNT WHERE TAGS INCLUDES ('a', 'b')"
+         select id from account where tags includes ("a" "b")))
 
-(define-test soql/in-call-form-list
+(define-test soql/select-list-forms
   :parent objects
-  (is string= "SELECT ID FROM ACCOUNT WHERE STATUS IN ('A', 'B')"
-      (cl-sf/objects:soql select id from account where (in status (list "A" "B")))))
+  (soql= "SELECT COUNT(ID) CNT, INDUSTRY FROM ACCOUNT GROUP BY INDUSTRY HAVING COUNT(ID) > 5"
+         select (count id) cnt industry from account
+         group by industry having (count id) > 5)
+  (soql= "SELECT FIELDS(ALL) FROM ACCOUNT LIMIT 200"
+         select (fields all) from account limit 200)
+  (soql= "SELECT ID, (SELECT ID FROM CONTACTS) FROM ACCOUNT"
+         select id (select id from contacts) from account)
+  (soql= "SELECT TYPEOF WHAT WHEN ACCOUNT THEN PHONE, WEBSITE WHEN OPPORTUNITY THEN AMOUNT ELSE NAME END FROM EVENT"
+         select typeof what when account then phone website
+                when opportunity then amount else name end
+         from event)
+  (soql= "SELECT ID FROM ACCOUNT GROUP BY ROLLUP(A, B)"
+         select id from account group by (rollup a b))
+  (soql= "SELECT ID FROM ACCOUNT WHERE CALENDAR_YEAR(CLOSEDATE) = 2024"
+         select id from account where (calendar_year closedate) = 2024))
 
-(define-test soql/fields-runtime-escape
+(define-test soql/other-clauses
   :parent objects
-  (let ((cols (list "Id" "Name")))
-    (is string= "SELECT Id, Name FROM ACCOUNT"
-        (cl-sf/objects:soql select (fields cols) from account))))
+  (soql= "SELECT ID FROM ACCOUNT USING SCOPE MINE WITH SECURITY_ENFORCED"
+         select id from account using scope mine with security_enforced)
+  (soql= "SELECT ID FROM ACCOUNT WITH DATA CATEGORY GEO__C AT (USA__C, UK__C)"
+         select id from account with data category geo__c at (usa__c uk__c))
+  (soql= "SELECT ID FROM ACCOUNT SET OPTIONS (A = 1, B = 'x')"
+         select id from account set options (a = 1 b = "x")))
 
-(define-test soql/select-wildcard-uses-cached-fields
+(define-test soql/object-named-like-a-clause
   :parent objects
-  ;; Network-free: pre-seed the wildcard cache so DESCRIBE-SOBJECT (which
-  ;; needs a live CONN) is never called — proves the cache hit path works.
-  (setf (gethash "WILDCARDTESTTYPE" cl-sf/objects::*wildcard-field-names-cache*)
-        (list "Id" "Name"))
-  (is string= "SELECT Id, Name FROM WILDCARDTESTTYPE"
-      (cl-sf/objects:soql select * from wildcardtesttype)))
+  (soql= "SELECT ID FROM ORDER ORDER BY ID"
+         select id from order order by id))
+
+(define-test soql/malformed-queries-signal-errors
+  :parent objects
+  (fail (macroexpand-1 '(cl-sf/objects:soql select id from account where)))
+  (fail (macroexpand-1 '(cl-sf/objects:soql select id from account where a ~ 1)))
+  (fail (macroexpand-1 '(cl-sf/objects:soql select from account)))
+  (fail (macroexpand-1 '(cl-sf/objects:soql id from account))))
+
+(define-test select/expands-to-constant-text-when-static
+  :parent objects
+  (is equal '(cl-sf/objects::%select "SELECT ID FROM ACCOUNT" nil)
+      (macroexpand-1 '(cl-sf/objects:select id from account)))
+  (is equal '(cl-sf/objects::%select "SELECT ID FROM ACCOUNT" t)
+      (macroexpand-1 '(cl-sf/objects:select id from account all rows))))
+
+;;; ── %QUERY-RECORDS — eager pagination ─────────────────────────────
+
+(defmacro with-stubbed-queries ((&key first next) &body body)
+  "Run BODY with /query returning FIRST and every next-page URL returning
+   the matching response from the alist NEXT."
+  `(let ((orig-query (fdefinition 'cl-sf/api::%query))
+         (orig-next  (fdefinition 'cl-sf/api::%query-next-page)))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'cl-sf/api::%query) (lambda (conn soql) (declare (ignore conn soql)) ,first)
+                  (fdefinition 'cl-sf/api::%query-next-page)
+                  (lambda (conn url) (declare (ignore conn)) (cdr (assoc url ,next :test #'string=))))
+            ,@body)
+       (setf (fdefinition 'cl-sf/api::%query) orig-query
+             (fdefinition 'cl-sf/api::%query-next-page) orig-next))))
+
+(define-test select/follows-every-page-into-one-vector
+  :parent objects
+  (with-stubbed-queries
+      (:first (mock-query-response :total 5 :done nil :records (vector 1 2) :next-url "p2")
+       :next  (list (cons "p2" (mock-query-response :total 5 :done nil :records (vector 3 4) :next-url "p3"))
+                    (cons "p3" (mock-query-response :total 5 :done t :records (vector 5)))))
+    (let ((result (cl-sf/api::%query-records nil "q" :coercer #'1+)))
+      (true (simple-vector-p result))
+      (is equalp #(2 3 4 5 6) result))))
+
+(define-test select/empty-result-is-empty-vector
+  :parent objects
+  (with-stubbed-queries (:first (mock-query-response :total 0))
+    (is equalp #() (cl-sf/api::%query-records nil "q"))))

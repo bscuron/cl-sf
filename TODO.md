@@ -38,11 +38,9 @@ DESCRIBE-SOBJECT via the stable REST API. Falls back automatically on any
 error from the OpenAPI endpoint.
 
 ** Pagination strategy (TODO #3)
-Default: lazy LAZY-RESULT-SET cursor — only fetches the next page when the
-current buffer is exhausted. One page of lparallel read-ahead is fired
-proactively to overlap network latency with caller processing.
-COLLECT-ALL available for cases where a full list is needed.
-DO-RECORDS macro for idiomatic iteration without exposing the cursor.
+SELECT is eager: it follows nextRecordsUrl until the result set is
+exhausted and returns one simple-vector of SOBJECTs. Pages chain by cursor
+URL, so they are fetched serially.
 
 ** Bulk auto-routing (TODO #4)
 DML operations are automatically routed to Bulk 2.0 when the record count

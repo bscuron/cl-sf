@@ -50,15 +50,6 @@
                cl-sf/api:api-request)
              '#:cl-sf)
 
-  ;; ── Pagination ──────────────────────────────────────────────────
-  (cl:import '(cl-sf/pagination:lazy-result-set
-               cl-sf/pagination:lazy-result-set-total-size
-               cl-sf/pagination:next-record
-               cl-sf/pagination:result-set-exhausted-p
-               cl-sf/pagination:collect-all
-               cl-sf/pagination:do-records)
-             '#:cl-sf)
-
   ;; ── Objects / public API (CLOS layer) ───────────────────────────
   (cl:import '(cl-sf/objects:sobject
                cl-sf/objects:sobject-id
@@ -73,8 +64,6 @@
                cl-sf/objects:load-sobject-classes/openapi
                cl-sf/objects:soql
                cl-sf/objects:select
-               cl-sf/objects:query
-               cl-sf/objects:query-all
                cl-sf/objects:sobject-get
                cl-sf/objects:sobject-create
                cl-sf/objects:sobject-update
@@ -155,11 +144,6 @@
                sobject->hash-table
                soql
                select
-               query
-               query-all
-               do-records
-               collect-all
-               next-record
                sobject-get
                sobject-create
                sobject-update

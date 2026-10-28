@@ -118,7 +118,7 @@
      • On 4xx/5xx: signals SF-API-ERROR with parsed Salesforce error details.
 
    This is the raw escape hatch.  Normal usage goes through the CLOS wrappers
-   in cl-sf/objects (query, sobject-get, sobject-create, …)."
+   in cl-sf/objects (select, sobject-get, sobject-create, …)."
   (unless conn
     (error 'sf-auth-error
            :message "No connection — pass :conn explicitly or wrap the call in WITH-CONN."))
@@ -175,7 +175,7 @@
 
 (defun %query (conn soql)
   "GET /query?q=SOQL — returns the raw jzon response hash-table.
-   Use cl-sf/objects:query for the CLOS-returning public version."
+   %QUERY-RECORDS is the paginating wrapper SELECT uses."
   (api-request :get "query" :params `(("q" . ,soql)) :conn conn))
 
 (defun %query-all (conn soql)
@@ -185,6 +185,26 @@
 (defun %query-next-page (conn next-records-url)
   "Fetch the next page using the absolute NEXT-RECORDS-URL from a prior response."
   (api-request :get next-records-url :conn conn))
+
+(defun %query-records (conn soql &key all (coercer #'identity))
+  "Run SOQL (via /queryAll when ALL) and follow nextRecordsUrl until the
+   result set is exhausted.  Returns a SIMPLE-VECTOR of (funcall COERCER
+   record) — pages are collected first, then copied once into an exactly
+   sized vector.  Pages are chained by cursor URL, so they fetch serially."
+  (let ((resp  (if all (%query-all conn soql) (%query conn soql)))
+        (pages '())
+        (total 0))
+    (loop
+      (let ((records (or (gethash "records" resp) #())))
+        (push records pages)
+        (incf total (length records)))
+      (let ((next (gethash "nextRecordsUrl" resp)))
+        (unless (stringp next) (return))
+        (setf resp (%query-next-page conn next))))
+    (let ((out (make-array total)) (i 0))
+      (dolist (records (nreverse pages) out)
+        (map nil (lambda (r) (setf (svref out i) (funcall coercer r)) (incf i))
+             records)))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Internal sObject CRUD functions

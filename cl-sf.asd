@@ -21,10 +21,7 @@
                (:file "auth")
                ;; TODO #2 — Core REST API endpoints (internal % layer, returns raw jzon)
                (:file "api")
-               ;; TODO #3 — Transparent pagination (lazy sequences + lparallel prefetch)
-               (:file "pagination")
                ;; TODO #5 — CLOS sObject definitions + public API wrappers
-               ;; Loads AFTER pagination so it can call make-lazy-result-set
                (:file "objects")
                ;; TODO #4 — Bulk 2.0 API support
                (:file "bulk")
@@ -41,7 +38,6 @@
   :components ((:file "packages")   ; test package + root suite + helpers
                (:file "auth-tests")
                (:file "api-tests")
-               (:file "pagination-tests")
                (:file "bulk-tests")
                (:file "objects-tests"))
   :perform (test-op (op c)

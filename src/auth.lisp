@@ -74,7 +74,7 @@
 
 (defparameter *lparallel-worker-count* (cl-cpus:get-number-of-processors)
   "Worker thread count for cl-sf's internal LPARALLEL:*KERNEL* (page
-   prefetch in cl-sf/pagination, parallel bulk-job polling in cl-sf/bulk,
+   parallel bulk-job polling in cl-sf/bulk,
    parallel DESCRIBE calls in LOAD-SOBJECT-CLASSES).  Defaults to the
    running user's actual processor count via CL-CPUS.  Rebind before the
    first call that needs parallelism to change it — these are
@@ -860,11 +860,11 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
 
    Examples:
      (with-conn \"myorg\"
-       (do-records (acct \"SELECT Id, Name FROM Account\")
-         (format t \"~A~%\" (account-name acct))))
+       (map nil (lambda (acct) (format t \"~A~%\" (account-name acct)))
+            (select Id Name FROM Account)))
 
      (with-conn (connect/jwt :client-id \"...\" :key-file #p\"server.key\"
                              :username \"me@example.com\")
-       (query \"SELECT Id FROM Account\"))"
+       (select Id FROM Account))"
   `(let ((*connection* (%with-conn-resolve ,org)))
      ,@body))

@@ -2,15 +2,13 @@
 ;;;; Package definitions for the cl-sf Salesforce client library.
 ;;;;
 ;;;; Dependency / load order:
-;;;;   packages → auth → api → pagination → objects → bulk → cl-sf
+;;;;   packages → auth → api → objects → bulk → cl-sf
 ;;;;
 ;;;; Layer responsibilities:
 ;;;;   cl-sf/auth       — OAuth flows, CONNECTION struct
 ;;;;   cl-sf/api        — Raw HTTP layer, returns jzon hash-tables.
 ;;;;                      Internal %-prefixed functions only; api-request is
 ;;;;                      the sole public escape hatch.
-;;;;   cl-sf/pagination — Lazy cursor over query result pages; coercer slot
-;;;;                      lets objects layer inject CLOS conversion.
 ;;;;   cl-sf/objects    — PUBLIC API: CLOS sobject classes, conversions,
 ;;;;                      and wrappers over cl-sf/api that return/accept
 ;;;;                      CLOS objects instead of raw hash-tables.
@@ -89,32 +87,11 @@
    #:api-request))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; cl-sf/pagination
-;;; ──────────────────────────────────────────────────────────────────
-
-(defpackage #:cl-sf/pagination
-  (:use #:cl #:cl-sf/auth #:cl-sf/api)
-  (:documentation
-   "Lazy paginated cursor over Salesforce query result sets.
-    Accepts a RECORD-COERCER function injected by cl-sf/objects so that
-    next-record returns CLOS objects without this package depending on
-    cl-sf/objects at compile time.")
-  (:export
-   #:lazy-result-set
-   #:lazy-result-set-p
-   #:lazy-result-set-total-size
-   #:make-lazy-result-set
-   #:next-record
-   #:result-set-exhausted-p
-   #:collect-all
-   #:do-records))
-
-;;; ──────────────────────────────────────────────────────────────────
 ;;; cl-sf/objects  — PUBLIC API (CLOS layer on top of cl-sf/api)
 ;;; ──────────────────────────────────────────────────────────────────
 
 (defpackage #:cl-sf/objects
-  (:use #:cl #:cl-sf/auth #:cl-sf/api #:cl-sf/pagination)
+  (:use #:cl #:cl-sf/auth #:cl-sf/api)
   (:documentation
    "Public Salesforce API surface.
     CLOS sObject classes + conversions + wrappers over the raw HTTP layer.
@@ -142,8 +119,6 @@
    ;; SOQL
    #:soql
    #:select
-   #:query
-   #:query-all
    ;; sObject CRUD (accept/return SOBJECT instances)
    #:sobject-get
    #:sobject-create
@@ -227,9 +202,10 @@
       (defvar *conn* (cl-sf:connect/jwt :client-id \"...\"
                                         :key-file  #p\"server.key\"
                                         :username  \"me@example.com\"))
-      ;; Query — returns lazy result set of SOBJECT instances:
-      (cl-sf:do-records (rec *conn* \"SELECT Id, Name FROM Account LIMIT 5\")
-        (format t \"~A~%\" (account-name rec)))")
+      ;; Query — returns a vector of SOBJECT instances:
+      (cl-sf:with-conn *conn*
+        (map nil (lambda (rec) (format t \"~A~%\" (account-name rec)))
+             (cl-sf:select Id Name FROM Account LIMIT 5)))")
   ;; No :export here — cl-sf.lisp imports the real symbols from the
   ;; subsystem packages and exports those same (identical) symbol objects.
   ;; Pre-declaring exports here would intern distinct CL-SF::FOO symbols
