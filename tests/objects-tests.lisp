@@ -490,33 +490,44 @@
     (fail (cl-sf/objects::%sobject-type-of-id "zzzxx000003DGb2AAG" conn) 'cl-sf/api:sf-api-error)
     (fail (cl-sf/objects::%sobject-type-of-id "001" conn) 'cl-sf/api:sf-api-error)))
 
-(define-test database-delete/accepts-ids-and-objects
+(define-test database-delete/infers-missing-type-from-id
   :parent objects
   (with-key-prefixes (conn ("001" "Account") ("003" "Contact"))
     (let ((log '())
-          (typed (make-instance 'test-contact :id "003xx000004TmiQAAS"))
+          (typed   (make-instance 'test-contact :id "003xx000004TmiQAAS"))
           (untyped (make-instance 'cl-sf/objects:sobject :id "001xx000003DGb2AAG")))
       (with-stubbed-dml (log)
-        ;; single Id string
-        (is eq t (cl-sf/objects:database-delete "001xx000003DGb2AAG" :conn conn))
+        (is eq t (cl-sf/objects:database-delete untyped :conn conn))
         (is equal '(:rest-delete "Account" . "001xx000003DGb2AAG") (first log))
-        ;; sobject with a registered type keeps it; one without gets it from its Id
+        ;; the inferred type is stored on the object
+        (is string= "Account" (cl-sf/objects:sobject-type untyped))
         (setf log '())
-        (cl-sf/objects:database-delete (list typed untyped "003xx000004TmiRAAS") :conn conn)
-        (is equal '("TestContact" "Account" "Contact")
-            (mapcar #'cadr (reverse log)))
-        ;; over the threshold: one bulk job per type
-        (setf log '())
-        (is equal '(:bulk-result :bulk-result)
-            (cl-sf/objects:database-delete
-             (list "001xx000003DGb2AAG" "003xx000004TmiQAAS" "001xx000003DGb3AAG")
-             :conn conn :bulk-threshold 1))
-        (is equal '((:bulk-delete "Account" . 2) (:bulk-delete "Contact" . 1))
-            (reverse log))
-        (setf log '())
-        (is eq :bulk-result
-            (cl-sf/objects:database-delete (list "001xx000003DGb2AAG" "001xx000003DGb3AAG")
-                                           :conn conn :bulk-threshold 1))))))
+        (is eq t (cl-sf/objects:database-delete (list typed) :conn conn))
+        (is equal '(:rest-delete "TestContact" . "003xx000004TmiQAAS") (first log))))))
+
+(define-test database-delete/bulk-route-returns-the-bulk-result
+  :parent objects
+  (let ((log '())
+        (objs (loop for id in '("003A" "003B" "003C")
+                    collect (make-instance 'test-contact :id id))))
+    (with-stubbed-dml (log)
+      (is eq :bulk-result (cl-sf/objects:database-delete objs :bulk-threshold 1))
+      (is equal '((:bulk-delete "TestContact" . 3)) log))))
+
+(define-test database-calls/mixed-types-are-an-error
+  :parent objects
+  (with-key-prefixes (conn ("001" "Account") ("003" "Contact"))
+    (let ((log '())
+          (a (make-instance 'cl-sf/objects:sobject :id "001xx000003DGb2AAG" :type "Account"))
+          (c (make-instance 'test-contact :id "003xx000004TmiQAAS")))
+      (with-stubbed-dml (log)
+        (fail (cl-sf/objects:database-insert (list a c) :conn conn) 'cl-sf/api:sf-api-error)
+        (fail (cl-sf/objects:database-update (vector a c) :conn conn) 'cl-sf/api:sf-api-error)
+        (fail (cl-sf/objects:database-upsert (list a c) "Ext__c" :conn conn) 'cl-sf/api:sf-api-error)
+        (fail (cl-sf/objects:database-delete (list a c) :conn conn :bulk-threshold 0)
+              'cl-sf/api:sf-api-error)
+        ;; nothing was sent
+        (is equal '() log)))))
 
 (define-test database-delete/sobject-without-id-is-an-error
   :parent objects
