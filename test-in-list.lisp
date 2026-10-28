@@ -1,0 +1,7 @@
+(push #p"C:/Users/bscur/quicklisp/local-projects/cl-sf/" asdf:*central-registry*)
+(asdf:load-system :cl-sf)
+(in-package :cl-sf/objects)
+(format t "~&Test 1: IN with literal list~%")
+(let ((result (soql SELECT Id FROM Account WHERE (IN Status ("A" "B")))))
+  (format t "Result: ~S~%Done~%" result))
+(sb-ext:exit)
