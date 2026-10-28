@@ -5,7 +5,7 @@
 ;;;;   - SOBJECT base class (all Salesforce records are instances of this or a subclass)
 ;;;;   - DEFINE-SOBJECT-CLASS macro (generates typed subclasses)
 ;;;;   - HASH->SOBJECT / SOBJECT->HASH-TABLE (conversion boundary)
-;;;;   - SELECT (SOQL queries) and the wrappers SOBJECT-GET, SOBJECT-CREATE, etc.
+;;;;   - SELECT (SOQL queries) and the wrappers SOBJECT-GET, DATABASE-INSERT, etc.
 ;;;;     All of these call cl-sf/api:% internals and convert at the boundary.
 ;;;;
 ;;;; The CLOS layer is the ONLY layer the user touches.
@@ -106,7 +106,7 @@
   ;; to a real slot (via *SOBJECT-SLOT-MAPS*), show the slot's CURRENT
   ;; value instead, so a SETF made after the fetch (e.g. (SETF
   ;; (ACCOUNT-NAME acct) "Foo")) is reflected in what prints — matching
-  ;; what SOBJECT->HASH-TABLE would actually send on SOBJECT-UPDATE.
+  ;; what SOBJECT->HASH-TABLE would actually send on DATABASE-UPDATE.
   ;; Keys with no slot (relationship fields, joined ALIAS.Field keys)
   ;; keep showing the raw fetched value — there's no live state for them.
   ;; Falls back to the old compact "#<Type Id>" form when there's no raw
@@ -286,7 +286,7 @@
      (let ((acct (cl-sf:sobject-get \"Account\" \"001...\")))
        (account-name acct))          ; → \"Acme Corp\"
        (setf (account-phone acct) \"555-1234\")
-       (cl-sf:sobject-update acct)"
+       (cl-sf:database-update acct)"
   (let* ((slot-defs
           (mapcar (lambda (spec)
                     (destructuring-bind (slot-name sf-name
@@ -832,16 +832,11 @@
      (sobject-get \"Account\" \"001xx000000001AAA\")"
   (hash->sobject (cl-sf/api::%sobject-get conn type id :fields fields) type conn))
 
-(defun sobject-create (object &key (conn *connection*))
+(defun %insert-one (object conn)
   "Create OBJECT in Salesforce.
    Serialises OBJECT to JSON via SOBJECT->HASH-TABLE, POSTs to the API,
    then sets SOBJECT-ID on OBJECT with the returned Id.
-   Returns OBJECT (now with Id populated).
-
-   Example:
-     (let ((acct (make-instance 'account :name \"Acme\" :phone \"555-1234\")))
-       (sobject-create acct)
-       (sobject-id acct))   ; → \"001xx...\""
+   Returns OBJECT (now with Id populated)."
   (let* ((type   (or (sobject-type object)
                      (error 'sf-api-error
                             :message "SOBJECT instance has no type set — \
@@ -853,32 +848,24 @@ cannot determine the Salesforce object type for create.")))
                                      (make-hash-table :test #'equal))))
     object))
 
-(defun sobject-update (object &key (conn *connection*))
+(defun %update-one (object conn)
   "Update an existing record in Salesforce.
    Serialises changed slots via SOBJECT->HASH-TABLE and PATCHes the API.
-   SOBJECT-ID must be non-nil.  Returns OBJECT.
-
-   Example:
-     (setf (account-phone acct) \"555-9999\")
-     (sobject-update acct)"
+   SOBJECT-ID must be non-nil.  Returns OBJECT."
   (unless (sobject-id object)
     (error 'sf-api-error
            :message "SOBJECT instance has no Id — cannot update a record without an Id. \
-Did you mean SOBJECT-CREATE?"))
+Did you mean DATABASE-INSERT?"))
   (cl-sf/api::%sobject-update conn
                                (sobject-type object)
                                (sobject-id   object)
                                (sobject->hash-table object))
   object)
 
-(defun sobject-delete (object-or-id &optional type &key (conn *connection*))
+(defun %delete-one (object-or-id type conn)
   "Delete a record from Salesforce.
    Accepts either a SOBJECT instance or an (id-string type-string) pair.
-   Returns T on success.
-
-   Examples:
-     (sobject-delete acct)
-     (sobject-delete \"001xx...\" \"Account\")"
+   Returns T on success."
   (etypecase object-or-id
     (sobject
      (cl-sf/api::%sobject-delete conn
@@ -887,18 +874,14 @@ Did you mean SOBJECT-CREATE?"))
     (string
      (unless type
        (error 'sf-api-error
-              :message "SOBJECT-DELETE: TYPE is required when passing an Id string."))
+              :message "DATABASE-DELETE: :TYPE is required when passing an Id string."))
      (cl-sf/api::%sobject-delete conn type object-or-id)))
   t)
 
-(defun sobject-upsert (object external-id-field &key (conn *connection*))
+(defun %upsert-one (object external-id-field conn)
   "Upsert OBJECT using EXTERNAL-ID-FIELD as the match key.
    EXTERNAL-ID-FIELD is the Salesforce API field name string (e.g. \"External_Id__c\").
-   On insert: sets SOBJECT-ID from the response.  Returns OBJECT.
-
-   Example:
-     (setf (account-my-external-id acct) \"EXT-001\")
-     (sobject-upsert acct \"My_External_Id__c\")"
+   On insert: sets SOBJECT-ID from the response.  Returns OBJECT."
   (let* ((type         (sobject-type object))
          ;; Resolve the external Id value — look in slot map first, fall back to raw
          (ext-id-value
@@ -1024,60 +1007,81 @@ Did you mean SOBJECT-CREATE?"))
     (when slot-map (mapcar #'car slot-map))))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; Multi-record operations with automatic Bulk 2.0 routing
+;;; DML — Apex's Database.insert / update / upsert / delete
+;;;
+;;; Each takes one SOBJECT or a sequence of them.  A single object, or a
+;;; sequence of at most BULK-THRESHOLD, goes through the REST API one
+;;; record at a time; a longer sequence is routed to Bulk 2.0.
 ;;; ──────────────────────────────────────────────────────────────────
 
-(defun sobject-create-many (objects &key (conn *connection*)
-                            (threshold cl-sf/bulk:*bulk-threshold*))
-  "Create OBJECTS (a list of SOBJECT instances) in Salesforce.
+(defun %dml (objects bulk-threshold one-fn bulk-fn)
+  "Dispatch a DML call: ONE-FN (lambda (object)) per record over REST, or
+   BULK-FN (no arguments) when OBJECTS is a sequence longer than
+   BULK-THRESHOLD.  Returns ONE-FN's result for a single object, BULK-FN's
+   result (a BULK-RESULT) for bulk, else OBJECTS."
+  (cond ((typep objects 'sobject) (funcall one-fn objects))
+        ((and bulk-threshold (> (length objects) bulk-threshold)) (funcall bulk-fn))
+        (t (map nil one-fn objects)
+           objects)))
 
-   If (length objects) > THRESHOLD: routes to BULK-INSERT (Bulk 2.0).
-     Returns a BULK-RESULT.
-   Otherwise: calls SOBJECT-CREATE for each record (REST API, in sequence).
-     Returns the list of objects with Ids populated.
+(defun database-insert (objects &key (conn *connection*)
+                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*))
+  "Insert OBJECTS (one SOBJECT or a sequence of them) into Salesforce.
+   Each object's SOBJECT-ID is set from the response.
 
-   THRESHOLD defaults to *BULK-THRESHOLD* (200).  Bind to 0 to always use Bulk.
+   A sequence longer than BULK-THRESHOLD (default *BULK-THRESHOLD*, 200) is
+   sent through Bulk 2.0 and a BULK-RESULT is returned; otherwise records
+   are inserted over REST and OBJECTS is returned.  BULK-THRESHOLD 0 always
+   uses Bulk; NIL never does.
 
    Example:
-     (let ((accts (list (make-instance 'account :name \"A\")
-                        (make-instance 'account :name \"B\"))))
-       (sobject-create-many accts))"
-  (if (and threshold (> (length objects) threshold))
-      (cl-sf/bulk:bulk-insert objects :conn conn)
-      (progn
-        (dolist (obj objects objects)
-          (sobject-create obj :conn conn)))))
+     (database-insert (make-instance 'account :name \"Acme\"))
+     (database-insert accounts)"
+  (%dml objects bulk-threshold
+        (lambda (o) (%insert-one o conn))
+        (lambda () (cl-sf/bulk:bulk-insert objects :conn conn))))
 
-(defun sobject-update-many (objects &key (conn *connection*)
-                            (threshold cl-sf/bulk:*bulk-threshold*))
-  "Update OBJECTS in Salesforce with automatic Bulk 2.0 routing.
-   All objects must have SOBJECT-ID set.
-   Returns BULK-RESULT (bulk path) or the list of objects (REST path)."
-  (if (and threshold (> (length objects) threshold))
-      (cl-sf/bulk:bulk-update objects :conn conn)
-      (progn
-        (dolist (obj objects objects)
-          (sobject-update obj :conn conn)))))
+(defun database-update (objects &key (conn *connection*)
+                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*))
+  "Update OBJECTS (one SOBJECT or a sequence), each of which must have an
+   SOBJECT-ID.  Only non-NIL slots are sent.  Routing and return value as
+   for DATABASE-INSERT.
 
-(defun sobject-delete-many (objects &key (conn *connection*)
-                            (threshold cl-sf/bulk:*bulk-threshold*))
-  "Delete OBJECTS from Salesforce with automatic Bulk 2.0 routing.
-   Returns BULK-RESULT (bulk path) or T for each deleted record (REST path)."
-  (if (and threshold (> (length objects) threshold))
-      (cl-sf/bulk:bulk-delete objects :conn conn)
-      (dolist (obj objects t)
-        (sobject-delete obj nil :conn conn))))
+   Example:
+     (setf (account-phone acct) \"555-9999\")
+     (database-update acct)"
+  (%dml objects bulk-threshold
+        (lambda (o) (%update-one o conn))
+        (lambda () (cl-sf/bulk:bulk-update objects :conn conn))))
 
-(defun sobject-upsert-many (objects external-id-field &key (conn *connection*)
-                            (threshold cl-sf/bulk:*bulk-threshold*))
-  "Upsert OBJECTS using EXTERNAL-ID-FIELD as the match key.
-   Routes to BULK-UPSERT when count > THRESHOLD, else REST SOBJECT-UPSERT.
-   Returns BULK-RESULT (bulk path) or the list of objects (REST path)."
-  (if (and threshold (> (length objects) threshold))
-      (cl-sf/bulk:bulk-upsert objects external-id-field :conn conn)
-      (progn
-        (dolist (obj objects objects)
-          (sobject-upsert obj external-id-field :conn conn)))))
+(defun database-upsert (objects external-id-field
+                        &key (conn *connection*)
+                          (bulk-threshold cl-sf/bulk:*bulk-threshold*))
+  "Upsert OBJECTS (one SOBJECT or a sequence), matching on EXTERNAL-ID-FIELD
+   (the API field name string, e.g. \"External_Id__c\").  Routing and
+   return value as for DATABASE-INSERT.
+
+   Example:
+     (database-upsert acct \"My_External_Id__c\")"
+  (%dml objects bulk-threshold
+        (lambda (o) (%upsert-one o external-id-field conn))
+        (lambda () (cl-sf/bulk:bulk-upsert objects external-id-field :conn conn))))
+
+(defun database-delete (objects &key type (conn *connection*)
+                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*))
+  "Delete OBJECTS (one SOBJECT or a sequence), or one record by Id string
+   with its sObject API name in TYPE.  Routing as for DATABASE-INSERT; the
+   REST path returns T, the bulk path a BULK-RESULT.
+
+   Examples:
+     (database-delete acct)
+     (database-delete \"001xx...\" :type \"Account\")"
+  (if (stringp objects)
+      (%delete-one objects type conn)
+      (let ((result (%dml objects bulk-threshold
+                          (lambda (o) (%delete-one o nil conn))
+                          (lambda () (cl-sf/bulk:bulk-delete objects :conn conn)))))
+        (if (eq result objects) t result))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Dynamic class generation

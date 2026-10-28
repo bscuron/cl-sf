@@ -118,7 +118,7 @@
      • On 4xx/5xx: signals SF-API-ERROR with parsed Salesforce error details.
 
    This is the raw escape hatch.  Normal usage goes through the CLOS wrappers
-   in cl-sf/objects (select, sobject-get, sobject-create, …)."
+   in cl-sf/objects (select, sobject-get, database-insert, …)."
   (unless conn
     (error 'sf-auth-error
            :message "No connection — pass :conn explicitly or wrap the call in WITH-CONN."))

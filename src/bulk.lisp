@@ -30,7 +30,7 @@
 ;;; ──────────────────────────────────────────────────────────────────
 
 (defparameter *bulk-threshold* 200
-  "Record count above which SOBJECT-CREATE-MANY etc. automatically route
+  "Record count above which DATABASE-INSERT etc. automatically route
    through Bulk 2.0 instead of the single-record REST API.
    Bind to NIL to disable auto-routing (always explicit).")
 
@@ -579,7 +579,7 @@ DEFINE-SOBJECT-CLASS)."))
      - FAILED      — (nil . error-string) conses for each failed record
      - UNPROCESSED — SOBJECT instances not yet processed
 
-   For automatic REST/Bulk routing see SOBJECT-CREATE-MANY.
+   For automatic REST/Bulk routing see DATABASE-INSERT.
 
    Example:
      (let ((result (bulk-insert (list a1 a2 a3))))

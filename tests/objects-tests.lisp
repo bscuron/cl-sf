@@ -405,3 +405,60 @@
         (true (typep (aref result 0) 'test-contact))
         (is string= "Hopper" (test-contact-last-name (aref result 0)))
         (is string= "003B" (cl-sf/objects:sobject-id (aref result 1)))))))
+
+;;; ── DML routing (REST vs Bulk) ────────────────────────────────────
+
+(defmacro with-stubbed-dml ((log) &body body)
+  "Replace the REST single-record helpers and bulk entry points with stubs
+   that push (name . arg) onto LOG."
+  `(let ((saved (mapcar #'fdefinition
+                        '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
+                          cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete))))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'cl-sf/objects::%insert-one)
+                  (lambda (o conn) (declare (ignore conn)) (push (cons :rest o) ,log) o)
+                  (fdefinition 'cl-sf/objects::%delete-one)
+                  (lambda (o type conn) (declare (ignore type conn)) (push (cons :rest-delete o) ,log) t)
+                  (fdefinition 'cl-sf/bulk:bulk-insert)
+                  (lambda (objs &key conn) (declare (ignore conn)) (push (cons :bulk (length objs)) ,log) :bulk-result)
+                  (fdefinition 'cl-sf/bulk:bulk-delete)
+                  (lambda (objs &key conn) (declare (ignore conn)) (push (cons :bulk-delete (length objs)) ,log) :bulk-result))
+            ,@body)
+       (loop for name in '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
+                           cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete)
+             for fn in saved
+             do (setf (fdefinition name) fn)))))
+
+(define-test database-insert/routes-by-count
+  :parent objects
+  (let ((log '()) (objs (loop repeat 3 collect (make-instance 'test-contact))))
+    (with-stubbed-dml (log)
+      ;; one object -> REST, returns the object
+      (is eq (first objs) (cl-sf/objects:database-insert (first objs)))
+      (is equal :rest (car (first log)))
+      ;; at or below the threshold -> REST per record, returns the sequence
+      (setf log '())
+      (is eq objs (cl-sf/objects:database-insert objs :bulk-threshold 3))
+      (is = 3 (length log))
+      ;; above the threshold -> one bulk call
+      (setf log '())
+      (is eq :bulk-result (cl-sf/objects:database-insert objs :bulk-threshold 2))
+      (is equal '((:bulk . 3)) log)
+      ;; vectors work too; NIL threshold never uses bulk
+      (setf log '())
+      (cl-sf/objects:database-insert (coerce objs 'vector) :bulk-threshold nil)
+      (is = 3 (length log)))))
+
+(define-test database-delete/returns-t-for-rest-and-result-for-bulk
+  :parent objects
+  (let ((log '()) (objs (loop repeat 3 collect (make-instance 'test-contact))))
+    (with-stubbed-dml (log)
+      (is eq t (cl-sf/objects:database-delete objs))
+      (is eq t (cl-sf/objects:database-delete (first objs)))
+      (is eq t (cl-sf/objects:database-delete "003xx" :type "TestContact"))
+      (is eq :bulk-result (cl-sf/objects:database-delete objs :bulk-threshold 0)))))
+
+(define-test database-delete/id-string-needs-type
+  :parent objects
+  (fail (cl-sf/objects:database-delete "003xx" :conn nil) 'cl-sf/api:sf-api-error))

@@ -121,14 +121,10 @@
    #:select
    ;; sObject CRUD (accept/return SOBJECT instances)
    #:sobject-get
-   #:sobject-create
-   #:sobject-update
-   #:sobject-delete
-   #:sobject-upsert
-   #:sobject-create-many
-   #:sobject-update-many
-   #:sobject-delete-many
-   #:sobject-upsert-many
+   #:database-insert
+   #:database-update
+   #:database-upsert
+   #:database-delete
    #:*sf-read-only-fields*
    ;; Client-side join (SOQL has no arbitrary JOIN)
    #:sobject-join
@@ -169,16 +165,6 @@
    ;; Configuration
    #:*bulk-threshold*
    #:*bulk-csv-chunk-size*
-   ;; Job lifecycle
-   #:create-bulk-job
-   #:close-bulk-job
-   #:abort-bulk-job
-   #:get-bulk-job
-   #:upload-job-data
-   ;; Results
-   #:get-successful-results
-   #:get-failed-results
-   #:get-unprocessed-results
    ;; High-level CLOS-first operations
    #:bulk-insert
    #:bulk-update

@@ -65,14 +65,10 @@
                cl-sf/objects:soql
                cl-sf/objects:select
                cl-sf/objects:sobject-get
-               cl-sf/objects:sobject-create
-               cl-sf/objects:sobject-update
-               cl-sf/objects:sobject-delete
-               cl-sf/objects:sobject-upsert
-               cl-sf/objects:sobject-create-many
-               cl-sf/objects:sobject-update-many
-               cl-sf/objects:sobject-delete-many
-               cl-sf/objects:sobject-upsert-many
+               cl-sf/objects:database-insert
+               cl-sf/objects:database-update
+               cl-sf/objects:database-upsert
+               cl-sf/objects:database-delete
                cl-sf/objects:sobject-join
                cl-sf/objects:describe-global
                cl-sf/objects:describe-sobject
@@ -94,15 +90,7 @@
                cl-sf/bulk:bulk-upsert
                cl-sf/bulk:bulk-delete
                cl-sf/bulk:*bulk-threshold*
-               cl-sf/bulk:*bulk-csv-chunk-size*
-               cl-sf/bulk:create-bulk-job
-               cl-sf/bulk:close-bulk-job
-               cl-sf/bulk:abort-bulk-job
-               cl-sf/bulk:get-bulk-job
-               cl-sf/bulk:upload-job-data
-               cl-sf/bulk:get-successful-results
-               cl-sf/bulk:get-failed-results
-               cl-sf/bulk:get-unprocessed-results)
+               cl-sf/bulk:*bulk-csv-chunk-size*)
              '#:cl-sf))
 
 ;;; This MUST be a separate top-level form from the IMPORT eval-when above:
@@ -145,14 +133,10 @@
                soql
                select
                sobject-get
-               sobject-create
-               sobject-update
-               sobject-delete
-               sobject-upsert
-               sobject-create-many
-               sobject-update-many
-               sobject-delete-many
-               sobject-upsert-many
+               database-insert
+               database-update
+               database-upsert
+               database-delete
                sobject-join
                describe-global
                describe-sobject
@@ -167,13 +151,5 @@
                bulk-upsert
                bulk-delete
                *bulk-threshold*
-               *bulk-csv-chunk-size*
-               create-bulk-job
-               close-bulk-job
-               abort-bulk-job
-               get-bulk-job
-               upload-job-data
-               get-successful-results
-               get-failed-results
-               get-unprocessed-results)
+               *bulk-csv-chunk-size*)
              '#:cl-sf))
