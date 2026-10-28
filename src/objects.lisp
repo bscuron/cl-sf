@@ -832,6 +832,44 @@
      (sobject-get \"Account\" \"001xx000000001AAA\")"
   (hash->sobject (cl-sf/api::%sobject-get conn type id :fields fields) type conn))
 
+(defvar *key-prefix-cache* (make-hash-table :test #'equal :synchronized t)
+  "instance-url -> hash-table of 3-character Id key prefix -> sObject name.")
+
+(defun %key-prefix-table (conn &optional refresh)
+  "Key prefix -> sObject API name for CONN's org, from DESCRIBE-GLOBAL (one
+   request per org, then cached).  REFRESH re-fetches, picking up custom
+   objects created since."
+  (let ((url (connection-instance-url conn)))
+    (when refresh (remhash url *key-prefix-cache*))
+    (or (gethash url *key-prefix-cache*)
+        (setf (gethash url *key-prefix-cache*)
+              (let ((table (make-hash-table :test #'equal)))
+                (loop for sobject across (or (gethash "sobjects" (cl-sf/api::%describe-global conn)) #())
+                      for prefix = (gethash "keyPrefix" sobject)
+                      when (stringp prefix)
+                        do (setf (gethash prefix table) (gethash "name" sobject)))
+                table)))))
+
+(defun %sobject-type-of-id (id conn)
+  "The sObject API name for record ID, from its 3-character key prefix
+   (every Salesforce Id starts with its object's unique prefix)."
+  (flet ((lookup (refresh)
+           (and (>= (length id) 15)
+                (gethash (subseq id 0 3) (%key-prefix-table conn refresh)))))
+    (or (lookup nil)
+        (lookup t)          ; maybe a custom object created after the cache
+        (error 'sf-api-error
+               :message (format nil "Cannot determine the sObject type of ~S — \
+its key prefix matches no object in this org." id)))))
+
+(defun %known-type (object conn)
+  "OBJECT's SOBJECT-TYPE, or, when unset, the type implied by its Id prefix."
+  (let ((type (sobject-type object)))
+    (cond ((and type (plusp (length type))) type)
+          ((sobject-id object) (%sobject-type-of-id (sobject-id object) conn))
+          (t (error 'sf-api-error
+                    :message "SOBJECT instance has neither a type nor an Id.")))))
+
 (defun %insert-one (object conn)
   "Create OBJECT in Salesforce.
    Serialises OBJECT to JSON via SOBJECT->HASH-TABLE, POSTs to the API,
@@ -857,25 +895,14 @@ cannot determine the Salesforce object type for create.")))
            :message "SOBJECT instance has no Id — cannot update a record without an Id. \
 Did you mean DATABASE-INSERT?"))
   (cl-sf/api::%sobject-update conn
-                               (sobject-type object)
+                               (%known-type object conn)
                                (sobject-id   object)
                                (sobject->hash-table object))
   object)
 
-(defun %delete-one (object-or-id type conn)
-  "Delete a record from Salesforce.
-   Accepts either a SOBJECT instance or an (id-string type-string) pair.
-   Returns T on success."
-  (etypecase object-or-id
-    (sobject
-     (cl-sf/api::%sobject-delete conn
-                                  (sobject-type object-or-id)
-                                  (sobject-id   object-or-id)))
-    (string
-     (unless type
-       (error 'sf-api-error
-              :message "DATABASE-DELETE: :TYPE is required when passing an Id string."))
-     (cl-sf/api::%sobject-delete conn type object-or-id)))
+(defun %delete-one (object conn)
+  "DELETE OBJECT (an SOBJECT with an Id and a type).  Returns T."
+  (cl-sf/api::%sobject-delete conn (sobject-type object) (sobject-id object))
   t)
 
 (defun %upsert-one (object external-id-field conn)
@@ -1016,11 +1043,11 @@ Did you mean DATABASE-INSERT?"))
 
 (defun %dml (objects bulk-threshold one-fn bulk-fn)
   "Dispatch a DML call: ONE-FN (lambda (object)) per record over REST, or
-   BULK-FN (no arguments) when OBJECTS is a sequence longer than
+   BULK-FN (lambda (list)) when OBJECTS is a sequence longer than
    BULK-THRESHOLD.  Returns ONE-FN's result for a single object, BULK-FN's
    result (a BULK-RESULT) for bulk, else OBJECTS."
   (cond ((typep objects 'sobject) (funcall one-fn objects))
-        ((and bulk-threshold (> (length objects) bulk-threshold)) (funcall bulk-fn))
+        ((and bulk-threshold (> (length objects) bulk-threshold)) (funcall bulk-fn (coerce objects 'list)))
         (t (map nil one-fn objects)
            objects)))
 
@@ -1039,7 +1066,7 @@ Did you mean DATABASE-INSERT?"))
      (database-insert accounts)"
   (%dml objects bulk-threshold
         (lambda (o) (%insert-one o conn))
-        (lambda () (cl-sf/bulk:bulk-insert objects :conn conn))))
+        (lambda (list) (cl-sf/bulk:bulk-insert list :conn conn))))
 
 (defun database-update (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
@@ -1052,7 +1079,7 @@ Did you mean DATABASE-INSERT?"))
      (database-update acct)"
   (%dml objects bulk-threshold
         (lambda (o) (%update-one o conn))
-        (lambda () (cl-sf/bulk:bulk-update objects :conn conn))))
+        (lambda (list) (cl-sf/bulk:bulk-update list :conn conn))))
 
 (defun database-upsert (objects external-id-field
                         &key (conn *connection*)
@@ -1065,23 +1092,58 @@ Did you mean DATABASE-INSERT?"))
      (database-upsert acct \"My_External_Id__c\")"
   (%dml objects bulk-threshold
         (lambda (o) (%upsert-one o external-id-field conn))
-        (lambda () (cl-sf/bulk:bulk-upsert objects external-id-field :conn conn))))
+        (lambda (list) (cl-sf/bulk:bulk-upsert list external-id-field :conn conn))))
 
-(defun database-delete (objects &key type (conn *connection*)
+(defun %delete-target (x conn)
+  "X (an Id string or an SOBJECT) as an SOBJECT carrying both Id and type."
+  (etypecase x
+    (string (make-instance 'sobject :id x :type (%sobject-type-of-id x conn)))
+    (sobject
+     (unless (sobject-id x)
+       (error 'sf-api-error :message "Cannot delete an SOBJECT that has no Id."))
+     (let ((type (sobject-type x)))
+       (if (and type (plusp (length type)))
+           x
+           (make-instance 'sobject :id (sobject-id x)
+                                   :type (%sobject-type-of-id (sobject-id x) conn)))))))
+
+(defun %bulk-delete-by-type (targets conn)
+  "One Bulk 2.0 delete job per sObject type among TARGETS (a job covers a
+   single type).  Returns that job's BULK-RESULT, or a list of them in
+   first-seen type order when TARGETS span several types."
+  (let ((groups (make-hash-table :test #'equal))
+        (order '()))
+    (dolist (o targets)
+      (let ((type (sobject-type o)))
+        (unless (nth-value 1 (gethash type groups)) (push type order))
+        (push o (gethash type groups))))
+    (let ((results (mapcar (lambda (type)
+                             (cl-sf/bulk:bulk-delete (nreverse (gethash type groups)) :conn conn))
+                           (nreverse order))))
+      (if (cdr results) results (first results)))))
+
+(defun database-delete (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
-  "Delete OBJECTS (one SOBJECT or a sequence), or one record by Id string
-   with its sObject API name in TYPE.  Routing as for DATABASE-INSERT; the
-   REST path returns T, the bulk path a BULK-RESULT.
+  "Delete records.  OBJECTS is an Id string, an SOBJECT, or a sequence of
+   either (mixed is fine).  A record's sObject type is its SOBJECT-TYPE or,
+   for a bare Id, the type that owns the Id's 3-character key prefix, so no
+   type is ever passed.
+
+   A single record, or a sequence of at most BULK-THRESHOLD, is deleted over
+   REST (returns T); a longer sequence goes through Bulk 2.0, one job per
+   sObject type (returns a BULK-RESULT, or a list of them for several types).
 
    Examples:
      (database-delete acct)
-     (database-delete \"001xx...\" :type \"Account\")"
-  (if (stringp objects)
-      (%delete-one objects type conn)
-      (let ((result (%dml objects bulk-threshold
-                          (lambda (o) (%delete-one o nil conn))
-                          (lambda () (cl-sf/bulk:bulk-delete objects :conn conn)))))
-        (if (eq result objects) t result))))
+     (database-delete \"001xx000003DGb2AAG\")
+     (database-delete (list acct \"003xx000004TmiQAAS\"))"
+  (if (or (stringp objects) (typep objects 'sobject))
+      (%delete-one (%delete-target objects conn) conn)
+      (let ((targets (map 'list (lambda (x) (%delete-target x conn)) objects)))
+        (if (and bulk-threshold (> (length targets) bulk-threshold))
+            (%bulk-delete-by-type targets conn)
+            (progn (dolist (o targets) (%delete-one o conn))
+                   t)))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Dynamic class generation

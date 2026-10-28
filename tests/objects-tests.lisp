@@ -410,7 +410,7 @@
 
 (defmacro with-stubbed-dml ((log) &body body)
   "Replace the REST single-record helpers and bulk entry points with stubs
-   that push (name . arg) onto LOG."
+   that push (kind . detail) onto LOG."
   `(let ((saved (mapcar #'fdefinition
                         '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
                           cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete))))
@@ -419,46 +419,105 @@
             (setf (fdefinition 'cl-sf/objects::%insert-one)
                   (lambda (o conn) (declare (ignore conn)) (push (cons :rest o) ,log) o)
                   (fdefinition 'cl-sf/objects::%delete-one)
-                  (lambda (o type conn) (declare (ignore type conn)) (push (cons :rest-delete o) ,log) t)
+                  (lambda (o conn) (declare (ignore conn))
+                    (push (cons :rest-delete (cons (cl-sf/objects:sobject-type o)
+                                                   (cl-sf/objects:sobject-id o)))
+                          ,log)
+                    t)
                   (fdefinition 'cl-sf/bulk:bulk-insert)
-                  (lambda (objs &key conn) (declare (ignore conn)) (push (cons :bulk (length objs)) ,log) :bulk-result)
+                  (lambda (objs &key conn) (declare (ignore conn))
+                    (push (cons :bulk (length objs)) ,log) :bulk-result)
                   (fdefinition 'cl-sf/bulk:bulk-delete)
-                  (lambda (objs &key conn) (declare (ignore conn)) (push (cons :bulk-delete (length objs)) ,log) :bulk-result))
+                  (lambda (objs &key conn) (declare (ignore conn))
+                    (push (cons :bulk-delete (cons (cl-sf/objects:sobject-type (first objs))
+                                                   (length objs)))
+                          ,log)
+                    :bulk-result))
             ,@body)
        (loop for name in '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
                            cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete)
              for fn in saved
              do (setf (fdefinition name) fn)))))
 
+(defmacro with-key-prefixes ((conn-var &rest prefixes) &body body)
+  "Run BODY with CONN-VAR bound to a fresh connection whose org maps each
+   (PREFIX NAME) pair, via a stubbed DESCRIBE-GLOBAL."
+  `(let* ((,conn-var (cl-sf/auth:make-connection
+                      :instance-url (format nil "https://~A.example.com" (random most-positive-fixnum))))
+          (orig (fdefinition 'cl-sf/api::%describe-global)))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'cl-sf/api::%describe-global)
+                  (lambda (conn) (declare (ignore conn))
+                    (let ((h (make-hash-table :test #'equal)))
+                      (setf (gethash "sobjects" h)
+                            (map 'vector (lambda (p)
+                                           (let ((o (make-hash-table :test #'equal)))
+                                             (setf (gethash "keyPrefix" o) (first p)
+                                                   (gethash "name" o) (second p))
+                                             o))
+                                 ',prefixes))
+                      h)))
+            ,@body)
+       (setf (fdefinition 'cl-sf/api::%describe-global) orig))))
+
 (define-test database-insert/routes-by-count
   :parent objects
   (let ((log '()) (objs (loop repeat 3 collect (make-instance 'test-contact))))
     (with-stubbed-dml (log)
-      ;; one object -> REST, returns the object
       (is eq (first objs) (cl-sf/objects:database-insert (first objs)))
       (is equal :rest (car (first log)))
-      ;; at or below the threshold -> REST per record, returns the sequence
       (setf log '())
       (is eq objs (cl-sf/objects:database-insert objs :bulk-threshold 3))
       (is = 3 (length log))
-      ;; above the threshold -> one bulk call
       (setf log '())
       (is eq :bulk-result (cl-sf/objects:database-insert objs :bulk-threshold 2))
       (is equal '((:bulk . 3)) log)
-      ;; vectors work too; NIL threshold never uses bulk
+      ;; a vector reaches the bulk function as a list; NIL threshold never uses bulk
+      (setf log '())
+      (cl-sf/objects:database-insert (coerce objs 'vector) :bulk-threshold 0)
+      (is equal '((:bulk . 3)) log)
       (setf log '())
       (cl-sf/objects:database-insert (coerce objs 'vector) :bulk-threshold nil)
       (is = 3 (length log)))))
 
-(define-test database-delete/returns-t-for-rest-and-result-for-bulk
+(define-test sobject-type-of-id/uses-key-prefix
   :parent objects
-  (let ((log '()) (objs (loop repeat 3 collect (make-instance 'test-contact))))
-    (with-stubbed-dml (log)
-      (is eq t (cl-sf/objects:database-delete objs))
-      (is eq t (cl-sf/objects:database-delete (first objs)))
-      (is eq t (cl-sf/objects:database-delete "003xx" :type "TestContact"))
-      (is eq :bulk-result (cl-sf/objects:database-delete objs :bulk-threshold 0)))))
+  (with-key-prefixes (conn ("001" "Account") ("003" "Contact") ("a0B" "Thing__c"))
+    (is string= "Account" (cl-sf/objects::%sobject-type-of-id "001xx000003DGb2AAG" conn))
+    (is string= "Contact" (cl-sf/objects::%sobject-type-of-id "003xx000004TmiQ" conn))
+    (is string= "Thing__c" (cl-sf/objects::%sobject-type-of-id "a0Bxx0000012345" conn))
+    (fail (cl-sf/objects::%sobject-type-of-id "zzzxx000003DGb2AAG" conn) 'cl-sf/api:sf-api-error)
+    (fail (cl-sf/objects::%sobject-type-of-id "001" conn) 'cl-sf/api:sf-api-error)))
 
-(define-test database-delete/id-string-needs-type
+(define-test database-delete/accepts-ids-and-objects
   :parent objects
-  (fail (cl-sf/objects:database-delete "003xx" :conn nil) 'cl-sf/api:sf-api-error))
+  (with-key-prefixes (conn ("001" "Account") ("003" "Contact"))
+    (let ((log '())
+          (typed (make-instance 'test-contact :id "003xx000004TmiQAAS"))
+          (untyped (make-instance 'cl-sf/objects:sobject :id "001xx000003DGb2AAG")))
+      (with-stubbed-dml (log)
+        ;; single Id string
+        (is eq t (cl-sf/objects:database-delete "001xx000003DGb2AAG" :conn conn))
+        (is equal '(:rest-delete "Account" . "001xx000003DGb2AAG") (first log))
+        ;; sobject with a registered type keeps it; one without gets it from its Id
+        (setf log '())
+        (cl-sf/objects:database-delete (list typed untyped "003xx000004TmiRAAS") :conn conn)
+        (is equal '("TestContact" "Account" "Contact")
+            (mapcar #'cadr (reverse log)))
+        ;; over the threshold: one bulk job per type
+        (setf log '())
+        (is equal '(:bulk-result :bulk-result)
+            (cl-sf/objects:database-delete
+             (list "001xx000003DGb2AAG" "003xx000004TmiQAAS" "001xx000003DGb3AAG")
+             :conn conn :bulk-threshold 1))
+        (is equal '((:bulk-delete "Account" . 2) (:bulk-delete "Contact" . 1))
+            (reverse log))
+        (setf log '())
+        (is eq :bulk-result
+            (cl-sf/objects:database-delete (list "001xx000003DGb2AAG" "001xx000003DGb3AAG")
+                                           :conn conn :bulk-threshold 1))))))
+
+(define-test database-delete/sobject-without-id-is-an-error
+  :parent objects
+  (fail (cl-sf/objects:database-delete (make-instance 'test-contact)) 'cl-sf/api:sf-api-error))
