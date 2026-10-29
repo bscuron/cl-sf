@@ -30,11 +30,151 @@
    e.g. \"Account\" → #<STANDARD-CLASS ACCOUNT>
    Populated by DEFINE-SOBJECT-CLASS and LOAD-SOBJECT-CLASSES.")
 
+(defvar *sobject-field-kinds* (make-hash-table :test #'eq)
+  "Maps class-name symbol → EQUAL hash-table of sf-field-name → \"date\" or
+   \"datetime\", for the fields whose slots hold LOCAL-TIME timestamps.
+   A class with no such fields has no entry.  Set by DEFINE-SOBJECT-CLASS.")
+
 (defvar *sobject-slot-maps* (make-hash-table :test #'eq)
   "Maps class-name symbol → alist of (sf-field-name-string . slot-name-symbol).
    Used by HASH->SOBJECT to populate slots and by SOBJECT->HASH-TABLE to
    serialise them back.
    e.g. 'ACCOUNT → ((\"Name\" . name) (\"Phone\" . phone) ...)")
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; Dates and datetimes: Salesforce text <-> LOCAL-TIME:TIMESTAMP
+;;; ──────────────────────────────────────────────────────────────────
+
+(defun %timestamp-text-slow (timestamp kind)
+  "The reference implementation of %TIMESTAMP-TEXT, via LOCAL-TIME's formatter
+   (about 40x slower; kept for years outside 0000-9999 and for the tests)."
+  (local-time:format-timestring
+   nil timestamp :timezone local-time:+utc-zone+
+                 :format (cond ((equal kind "date")
+                                '((:year 4) #\- (:month 2) #\- (:day 2)))
+                               ((equal kind "time")
+                                '((:hour 2) #\: (:min 2) #\: (:sec 2) #\. (:msec 3) #\Z))
+                               (t
+                                '((:year 4) #\- (:month 2) #\- (:day 2) #\T
+                                  (:hour 2) #\: (:min 2) #\: (:sec 2) #\. (:msec 3) #\Z)))))
+
+(defun %timestamp-text (timestamp kind)
+  "TIMESTAMP (a LOCAL-TIME:TIMESTAMP, taken as UTC) as Salesforce text for a
+   field of describe type KIND: \"date\" → 2024-03-05, \"time\" → 03:04:05.000Z,
+   anything else (datetime) → 2024-03-05T03:04:05.000Z.  Used for query
+   literals and for values sent to Salesforce.  Writes the digits directly:
+   LOCAL-TIME's formatter costs ~2 µs and ~600 bytes a value, which adds up
+   over a large save."
+  (declare (type local-time:timestamp timestamp) (optimize (speed 3) (safety 0)))
+  (let* ((days (local-time:day-of timestamp))        ; since 2000-03-01
+         (sod  (local-time:sec-of timestamp))        ; seconds into the UTC day
+         (msec (floor (the (integer 0 999999999) (local-time:nsec-of timestamp)) 1000000)))
+    (declare (type fixnum days sod msec))
+    ;; days since 1970-01-01 → civil date (Howard Hinnant's algorithm)
+    (let* ((z   (+ days 11017 719468))
+           (era (floor z 146097))
+           (doe (- z (* era 146097)))
+           (yoe (floor (- doe (floor doe 1460) (- (floor doe 36524)) (floor doe 146096)) 365))
+           (doy (- doe (+ (* 365 yoe) (floor yoe 4) (- (floor yoe 100)))))
+           (mp  (floor (+ (* 5 doy) 2) 153))
+           (day (1+ (- doy (floor (+ (* 153 mp) 2) 5))))
+           (month (if (< mp 10) (+ mp 3) (- mp 9)))
+           (year  (+ yoe (* era 400) (if (<= month 2) 1 0))))
+      (declare (type fixnum z era doe yoe doy mp day month year))
+      (if (not (<= 0 year 9999))
+          (%timestamp-text-slow timestamp kind)
+          (let* ((date-p (equal kind "date"))
+                 (time-p (equal kind "time"))
+                 (out (make-string (cond (date-p 10) (time-p 13) (t 24))))
+                 (i 0))
+            (declare (type fixnum i))
+            (macrolet ((put (char) `(progn (setf (schar out i) ,char) (incf i)))
+                       (digits (value width)
+                         `(let ((v ,value))
+                            (declare (type fixnum v))
+                            (loop for k from (1- ,width) downto 0
+                                  do (setf (schar out (+ i k)) (code-char (+ 48 (mod v 10)))
+                                           v (floor v 10)))
+                            (incf i ,width))))
+              (unless time-p
+                (digits year 4) (put #\-) (digits month 2) (put #\-) (digits day 2))
+              (unless date-p
+                (unless time-p (put #\T))
+                (digits (floor sod 3600) 2) (put #\:)
+                (digits (floor (mod sod 3600) 60) 2) (put #\:)
+                (digits (mod sod 60) 2) (put #\.)
+                (digits msec 3) (put #\Z)))
+            out)))))
+
+(defun %parse-temporal (string kind)
+  "Parse the date or datetime Salesforce wrote in STRING into a
+   LOCAL-TIME:TIMESTAMP, or return NIL if it isn't one.  Accepts 2024-03-05,
+   2024-03-05T03:04:05Z, .123 fractions up to nanoseconds, and the offsets
+   Z, +0000, +00:00 and +00 (REST writes +0000, GraphQL writes Z).  A date
+   is midnight UTC.  KIND (\"date\" or \"datetime\") only says whether a time
+   part is expected: a date field ignores one."
+  (declare (type string string))
+  (let ((n (length string)) (i 0))
+    (declare (type fixnum n i))
+    (labels ((digits (count)
+               (when (<= (+ i count) n)
+                 (let ((v 0))
+                   (dotimes (k count)
+                     (let ((d (digit-char-p (char string (+ i k)))))
+                       (unless d (return-from digits nil))
+                       (setf v (+ (* v 10) d))))
+                   (incf i count)
+                   v)))
+             (next (c)
+               (when (and (< i n) (char= (char string i) c))
+                 (incf i)
+                 t)))
+      (let ((year (digits 4)) month day)
+        (unless (and year (next #\-) (setf month (digits 2)) (next #\-) (setf day (digits 2))
+                     (<= 1 month 12) (<= 1 day 31))
+          (return-from %parse-temporal nil))
+        (when (or (= i n) (equal kind "date"))
+          (return-from %parse-temporal
+            (local-time:encode-timestamp 0 0 0 0 day month year :offset 0)))
+        (unless (or (next #\T) (next #\Space))
+          (return-from %parse-temporal nil))
+        (let ((hour (digits 2)) minute (second 0) (nsec 0) (offset 0))
+          (unless (and hour (next #\:) (setf minute (digits 2))
+                       (<= hour 23) (<= minute 59))
+            (return-from %parse-temporal nil))
+          (when (next #\:)
+            (setf second (digits 2))
+            (unless (and second (<= second 60))
+              (return-from %parse-temporal nil)))
+          (when (next #\.)
+            (let ((start i))
+              (loop while (and (< i n) (digit-char-p (char string i))) do (incf i))
+              (let ((len (- i start)))
+                (unless (<= 1 len 9) (return-from %parse-temporal nil))
+                (setf nsec (* (parse-integer string :start start :end i)
+                              (expt 10 (- 9 len)))))))
+          (cond ((next #\Z))
+                ((and (< i n) (member (char string i) '(#\+ #\-)))
+                 (let ((sign (if (char= (char string i) #\-) -1 1)))
+                   (incf i)
+                   (let ((oh (digits 2)) (om 0))
+                     (unless oh (return-from %parse-temporal nil))
+                     (next #\:)
+                     (when (< i n)
+                       (setf om (digits 2))
+                       (unless om (return-from %parse-temporal nil)))
+                     (setf offset (* sign (+ (* oh 3600) (* om 60))))))))
+          (unless (= i n) (return-from %parse-temporal nil))
+          (local-time:encode-timestamp nsec second minute hour day month year :offset offset))))))
+
+(defun %from-salesforce (value kind)
+  "VALUE as stored in a slot: a date/datetime STRING of KIND becomes a
+   timestamp; anything else (including a string that doesn't parse) is kept."
+  (or (and (stringp value) (%parse-temporal value kind)) value))
+
+(defun %to-salesforce (value kind)
+  "VALUE as sent to Salesforce: a timestamp becomes text; anything else is kept."
+  (if (typep value 'local-time:timestamp) (%timestamp-text value kind) value))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Base class
@@ -166,8 +306,15 @@
                ,class-sym ,name
              ,@(loop for field across (gethash "fields" desc #())
                      for sf-name = (gethash "name" field)
-                     unless (member sf-name *sf-read-only-fields* :test #'equal)
-                     collect (list (intern (string-upcase sf-name)) sf-name))))
+                     for sf-type = (gethash "type" field)
+                     for temporal = (member sf-type '("date" "datetime") :test #'equal)
+                     ;; read-only dates (CreatedDate, LastModifiedDate, ...) get a
+                     ;; slot too, so they read as timestamps; writes skip them by name
+                     when (or temporal
+                              (not (member sf-name *sf-read-only-fields* :test #'equal)))
+                       collect (if temporal
+                                   (list (intern (string-upcase sf-name)) sf-name :sf-type sf-type)
+                                   (list (intern (string-upcase sf-name)) sf-name)))))
     class-sym))
 
 (defun %register-sobject-class (conn name &optional desc)
@@ -222,12 +369,15 @@
         (let* ((obj      (make-instance class :id id :type sf-type :raw hash))
                (slot-map (gethash (class-name class) *sobject-slot-maps*)))
           (when slot-map
-            (dolist (entry slot-map)
-              (let ((sf-name   (car entry))
-                    (slot-name (cdr entry)))
-                (let ((val (gethash sf-name hash)))
-                  (when (not (null val))
-                    (setf (slot-value obj slot-name) val))))))
+            (let ((kinds (gethash (class-name class) *sobject-field-kinds*)))
+              (dolist (entry slot-map)
+                (let* ((sf-name (car entry))
+                       (val     (gethash sf-name hash)))
+                  ;; a JSON null parses as the symbol CL:NULL: an empty field
+                  (unless (or (null val) (eq val 'null))
+                    (setf (slot-value obj (cdr entry))
+                          (let ((kind (and kinds (gethash sf-name kinds))))
+                            (if kind (%from-salesforce val kind) val))))))))
           obj)
         ;; ── Generic fallback: unknown type, or no CONN to describe it ─
         (make-instance 'sobject :id id :type sf-type :raw hash))))
@@ -277,13 +427,18 @@
     (if slot-map
         ;; ── Typed path ───────────────────────────────────────────────
         (let* ((entries (%writable-slots slot-map))
-               (result  (make-hash-table :test #'equal :size (max 7 (length entries)))))
+               (result  (make-hash-table :test #'equal :size (max 7 (length entries))))
+               (kinds   (gethash (class-name (class-of obj)) *sobject-field-kinds*)))
           (dolist (entry entries result)
             (let ((slot (cdr entry)))
               (when (slot-boundp obj slot)
                 (let ((val (slot-value obj slot)))
                   (when val
-                    (setf (gethash (car entry) result) val)))))))
+                    (setf (gethash (car entry) result)
+                          (if (typep val 'local-time:timestamp)
+                              (%to-salesforce val (or (and kinds (gethash (car entry) kinds))
+                                                      "datetime"))
+                              val))))))))
         ;; ── Generic path: copy from sf-raw ──────────────────────────
         (let ((raw (sobject-raw obj)))
           (if raw
@@ -304,7 +459,10 @@
   "Define a CLOS class CLASS-NAME representing the Salesforce object SF-API-NAME.
    Registers the class in *SOBJECT-CLASSES* and its field map in *SOBJECT-SLOT-MAPS*.
 
-   FIELD-SPECS — list of (slot-name sf-field-name &key type documentation)
+   FIELD-SPECS — list of (slot-name sf-field-name &key type documentation sf-type)
+   SF-TYPE \"date\" or \"datetime\" makes the slot hold a LOCAL-TIME:TIMESTAMP:
+   text from Salesforce is parsed on the way in, and a timestamp is written
+   back as text by SOBJECT->HASH-TABLE and the Bulk CSV writer.
 
    Generated accessor name: <class-name>-<slot-name>
 
@@ -323,9 +481,9 @@
   (let* ((slot-defs
           (mapcar (lambda (spec)
                     (destructuring-bind (slot-name sf-name
-                                        &key (type t) documentation)
+                                        &key (type t) documentation sf-type)
                         spec
-                      (declare (ignore sf-name))
+                      (declare (ignore sf-name sf-type))
                       `(,slot-name
                         :initarg       ,(alexandria:make-keyword slot-name)
                         :accessor      ,(intern (format nil "~A-~A"
@@ -339,7 +497,12 @@
                              (destructuring-bind (slot-name sf-name &rest _) spec
                                (declare (ignore _))
                                `(cons ,sf-name ',slot-name)))
-                           field-specs))))
+                           field-specs)))
+         (temporal-fields
+          (loop for (nil sf-name . options) in field-specs
+                for sf-type = (getf options :sf-type)
+                when (member sf-type '("date" "datetime") :test #'equal)
+                  collect (cons sf-name sf-type))))
     `(progn
        (defclass ,class-name (sobject)
          (,@slot-defs)
@@ -349,6 +512,14 @@
        (setf (gethash ,sf-api-name *sobject-classes*) (find-class ',class-name))
        ;; Register field↔slot mapping for conversion
        (setf (gethash ',class-name *sobject-slot-maps*) ,field-map-form)
+       ;; Which of those slots hold LOCAL-TIME timestamps (none: no entry)
+       ,(if temporal-fields
+            `(setf (gethash ',class-name *sobject-field-kinds*)
+                   (let ((kinds (make-hash-table :test #'equal)))
+                     (loop for (sf-name . kind) in ',temporal-fields
+                           do (setf (gethash sf-name kinds) kind))
+                     kinds))
+            `(remhash ',class-name *sobject-field-kinds*))
        ',class-name)))
 
 ;;; ──────────────────────────────────────────────────────────────────
@@ -442,8 +613,6 @@
   (loop for (pl . more) on piece-lists
         append pl
         when more collect sep))
-
-(declaim (ftype function %timestamp-text))     ; schema.lisp, loaded after this file
 
 (defvar *soql-from* nil
   "While a query is compiled: the sObject name of its FROM clause (a string).")

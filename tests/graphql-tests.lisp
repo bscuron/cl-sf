@@ -50,7 +50,9 @@
         (gql-describe "Group" :fields '("Id" "Name"))
         (gql-describe "Lead" :fields '("Id" "Company")
                              :parents '(("OwnerId" "Owner" "Group" "User")))
-        (gql-describe "GqlThing__c" :fields '("Id" "Name" "Score__c"))))
+        (gql-describe "GqlThing__c" :fields '("Id" "Name" "Score__c" "CreatedById"
+                                              ("Seen__c" . "datetime") ("Born__c" . "date")
+                                              ("CreatedDate" . "datetime")))))
 
 (defun json (string) (com.inuoe.jzon:parse string))
 
@@ -356,7 +358,7 @@
 (define-test gql/timestamps-render-as-date-or-datetime-by-field-type
   :parent graphql
   (let ((ts (local-time:encode-timestamp 0 5 4 3 5 3 2024 :timezone local-time:+utc-zone+)))
-    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05Z\"}}}"
+    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05.000Z\"}}}"
         (where-text (CreatedDate (gt ts)))))
   (let ((ts (local-time:encode-timestamp 0 5 4 3 5 3 2024 :timezone local-time:+utc-zone+)))
     (is string= "Opportunity(where: {CloseDate: {gt: {value: \"2024-03-05\"}}}, first: 2000, upperBound: 100000) { edges { node { Id } } pageInfo { hasNextPage endCursor } }"
@@ -412,7 +414,7 @@
   (with-gql-org (requests)
     (let ((ts *ts*))
       ;; datetime field → datetime literal
-      (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05Z"
+      (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05.000Z"
           (cl-sf/objects:soql select id from account where createddate > ts))
       ;; date field → date literal
       (is string= "SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE <= 2024-03-05"
@@ -421,7 +423,7 @@
       (is string= "SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE = 2024-03-06"
           (cl-sf/objects:soql select id from opportunity where closedate = (identity *ts2*)))
       ;; through a relationship
-      (is string= "SELECT ID FROM CONTACT WHERE ACCOUNT.CREATEDDATE >= 2024-03-05T03:04:05Z"
+      (is string= "SELECT ID FROM CONTACT WHERE ACCOUNT.CREATEDDATE >= 2024-03-05T03:04:05.000Z"
           (cl-sf/objects:soql select id from contact where account.createddate >= ts)))))
 
 (define-test temporal/select-renders-lists-of-timestamps
@@ -435,14 +437,14 @@
   :parent temporal
   (let ((ts *ts*) (cl-sf/auth:*connection* nil))
     ;; no connection at all (soql just builds text)
-    (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05Z"
+    (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05.000Z"
         (cl-sf/objects:soql select id from account where createddate > ts)))
   (with-gql-org (requests)
     (let ((ts *ts*))
       ;; a field the org doesn't know, an object it doesn't know
-      (is string= "SELECT ID FROM ACCOUNT WHERE NOSUCH__C > 2024-03-05T03:04:05Z"
+      (is string= "SELECT ID FROM ACCOUNT WHERE NOSUCH__C > 2024-03-05T03:04:05.000Z"
           (cl-sf/objects:soql select id from account where nosuch__c > ts))
-      (is string= "SELECT ID FROM NOSUCHOBJECT__C WHERE X > 2024-03-05T03:04:05Z"
+      (is string= "SELECT ID FROM NOSUCHOBJECT__C WHERE X > 2024-03-05T03:04:05.000Z"
           (cl-sf/objects:soql select id from nosuchobject__c where x > ts)))))
 
 (define-test temporal/select-only-looks-up-metadata-for-timestamps
@@ -467,14 +469,186 @@
 (define-test temporal/timestamp-text
   :parent temporal
   (is string= "2024-03-05" (cl-sf/objects::%timestamp-text *ts* "date"))
-  (is string= "2024-03-05T03:04:05Z" (cl-sf/objects::%timestamp-text *ts* "datetime"))
+  (is string= "2024-03-05T03:04:05.000Z" (cl-sf/objects::%timestamp-text *ts* "datetime"))
   (is string= "03:04:05.000Z" (cl-sf/objects::%timestamp-text *ts* "time"))
   ;; always UTC: 12:04:05 at UTC+9 is the same instant as 03:04:05 UTC
   (let ((tokyo (local-time:encode-timestamp 0 5 4 12 5 3 2024 :offset 32400)))
-    (is string= "2024-03-05T03:04:05Z" (cl-sf/objects::%timestamp-text tokyo "datetime"))))
+    (is string= "2024-03-05T03:04:05.000Z" (cl-sf/objects::%timestamp-text tokyo "datetime"))))
 
 (define-test temporal/gql-uses-the-same-literals
   :parent temporal
   (let ((ts *ts*))
-    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05Z\"}}}"
+    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05.000Z\"}}}"
         (where-text (CreatedDate (gt ts))))))
+
+;;; ── Dates and datetimes on returned objects are LOCAL-TIME timestamps ──
+
+(defun ts (&rest args)
+  "A UTC timestamp: (ts year month day [hour minute second [nsec]])."
+  (destructuring-bind (year month day &optional (hour 0) (minute 0) (second 0) (nsec 0)) args
+    (local-time:encode-timestamp nsec second minute hour day month year :offset 0)))
+
+(define-test temporal/parses-what-salesforce-sends
+  :parent temporal
+  (flet ((parse (string &optional (kind "datetime")) (cl-sf/objects::%parse-temporal string kind)))
+    ;; REST: +0000, GraphQL: Z, fractions
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (parse "2024-03-05T03:04:05.000+0000"))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (parse "2024-03-05T03:04:05.000Z"))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (parse "2024-03-05T03:04:05Z"))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5 123000000) (parse "2024-03-05T03:04:05.123Z"))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5 123456789) (parse "2024-03-05T03:04:05.123456789Z"))
+    ;; offsets are applied: 12:04:05 at UTC+9 is 03:04:05 UTC
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (parse "2024-03-05T12:04:05+09:00"))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (parse "2024-03-05T12:04:05+0900"))
+    (is local-time:timestamp= (ts 2024 3 5 8 34 5) (parse "2024-03-05T03:04:05-05:30"))
+    ;; dates are midnight UTC
+    (is local-time:timestamp= (ts 2024 3 5) (parse "2024-03-05" "date"))
+    (is local-time:timestamp= (ts 2024 3 5) (parse "2024-03-05"))
+    (is local-time:timestamp= (ts 2024 3 5) (parse "2024-03-05T03:04:05.000Z" "date")
+        "a date field ignores a time part")
+    ;; things that aren't dates are not parsed
+    (false (parse "hello"))
+    (false (parse ""))
+    (false (parse "2024-13-05"))
+    (false (parse "2024-03-05T25:00:00Z"))
+    (false (parse "2024-03-05T03:04:05.Z"))
+    (false (parse "2024-03-05T03:04:05Zjunk"))
+    (false (parse "03:04:05.000Z"))))
+
+(define-test temporal/text-and-parse-round-trip
+  :parent temporal
+  (dolist (string '("2024-03-05T03:04:05.000Z" "2024-03-05T03:04:05.123Z" "1999-12-31T23:59:59.999Z"))
+    (is string= string
+        (cl-sf/objects::%timestamp-text (cl-sf/objects::%parse-temporal string "datetime") "datetime")))
+  (is string= "2024-03-05"
+      (cl-sf/objects::%timestamp-text (cl-sf/objects::%parse-temporal "2024-03-05" "date") "date")))
+
+(cl-sf/objects:define-sobject-class temporal-probe "TemporalProbe__c"
+  (name    "Name")
+  (seen    "Seen__c"        :sf-type "datetime")
+  (born    "Born__c"        :sf-type "date")
+  (created "CreatedDate"    :sf-type "datetime"))
+
+(defun probe-hash (&rest pairs)
+  (let ((h (make-hash-table :test #'equal)))
+    (loop for (k v) on pairs by #'cddr do (setf (gethash k h) v))
+    h))
+
+(define-test temporal/records-hold-timestamps-in-date-and-datetime-slots
+  :parent temporal
+  (let ((probe (cl-sf/objects:hash->sobject
+                (probe-hash "Name" "n" "Seen__c" "2024-03-05T03:04:05.000+0000"
+                            "Born__c" "1990-02-03" "CreatedDate" "2020-01-02T00:00:00.000Z")
+                "TemporalProbe__c")))
+    (is string= "n" (slot-value probe 'name))
+    (is local-time:timestamp= (ts 2024 3 5 3 4 5) (slot-value probe 'seen))
+    (is local-time:timestamp= (ts 1990 2 3) (slot-value probe 'born))
+    (is local-time:timestamp= (ts 2020 1 2) (slot-value probe 'created))
+    ;; the raw JSON is untouched
+    (is string= "2024-03-05T03:04:05.000+0000"
+        (gethash "Seen__c" (cl-sf/objects:sobject-raw probe)))))
+
+(define-test temporal/unparseable-text-is-kept-and-null-is-empty
+  :parent temporal
+  (let ((probe (cl-sf/objects:hash->sobject
+                (probe-hash "Name" 'null "Seen__c" "not a date" "Born__c" 'null)
+                "TemporalProbe__c")))
+    (is string= "not a date" (slot-value probe 'seen))
+    (false (slot-value probe 'name) "a JSON null is an empty slot, not the symbol NULL")
+    (false (slot-value probe 'born))))
+
+(define-test temporal/timestamps-are-written-back-as-salesforce-text
+  :parent temporal
+  (let* ((probe (make-instance 'temporal-probe :name "n"
+                                               :seen (ts 2024 3 5 3 4 5 123000000)
+                                               :born (ts 1990 2 3)
+                                               :created (ts 2020 1 2)))
+         (hash  (cl-sf/objects:sobject->hash-table probe)))
+    (is string= "2024-03-05T03:04:05.123Z" (gethash "Seen__c" hash))
+    (is string= "1990-02-03" (gethash "Born__c" hash))
+    (false (nth-value 1 (gethash "CreatedDate" hash)) "read-only: never sent"))
+  ;; text a caller put in a slot themselves goes out untouched
+  (let ((hash (cl-sf/objects:sobject->hash-table
+               (make-instance 'temporal-probe :seen "2024-03-05T00:00:00Z"))))
+    (is string= "2024-03-05T00:00:00Z" (gethash "Seen__c" hash))))
+
+(define-test temporal/csv-writes-dates-and-datetimes-by-slot-kind
+  :parent temporal
+  (let ((probe (make-instance 'temporal-probe :name "n"
+                                              :seen (ts 2024 3 5 3 4 5)
+                                              :born (ts 1990 2 3))))
+    (is string= (format nil "Name,Seen__c,Born__c~%n,2024-03-05T03:04:05.000Z,1990-02-03~%")
+        (csv-text (cl-sf/bulk::%sobjects->csv (list probe) '("Name" "Seen__c" "Born__c"))))))
+
+(define-test temporal/redefining-a-class-without-temporal-fields-forgets-them
+  :parent temporal
+  (cl-sf/objects:define-sobject-class kinds-probe "KindsProbe__c"
+    (seen "Seen__c" :sf-type "datetime"))
+  (true (gethash 'kinds-probe cl-sf/objects::*sobject-field-kinds*))
+  (cl-sf/objects:define-sobject-class kinds-probe "KindsProbe__c"
+    (seen "Seen__c"))
+  (false (gethash 'kinds-probe cl-sf/objects::*sobject-field-kinds*)))
+
+(define-test temporal/generated-classes-get-timestamp-slots-including-read-only-dates
+  :parent temporal
+  (with-gql-org (requests)
+    (let* ((desc (find "GqlThing__c" *gql-org* :key (lambda (d) (gethash "name" d)) :test #'string=))
+           (class-name (cl-sf/objects::%eval-define-sobject-class "GqlThing__c" desc))
+           (slots (gethash class-name cl-sf/objects:*sobject-slot-maps*))
+           (kinds (gethash class-name cl-sf/objects::*sobject-field-kinds*)))
+      (true (assoc "Seen__c" slots :test #'equal))
+      (true (assoc "CreatedDate" slots :test #'equal) "a read-only datetime is readable")
+      (false (assoc "CreatedById" slots :test #'equal) "read-only non-dates stay out")
+      (false (assoc "Id" slots :test #'equal))
+      (is string= "datetime" (gethash "CreatedDate" kinds))
+      (is string= "date" (gethash "Born__c" kinds))
+      (false (gethash "Name" kinds)))))
+
+(define-test temporal/gql-records-have-timestamps
+  :parent temporal
+  (with-gql-org (requests :responses
+                          (list "{\"data\":{\"uiapi\":{\"query\":{\"GqlThing__c\":{\"edges\":[{\"node\":{\"Id\":\"a01\",\"Name\":{\"value\":\"T\"},\"Seen__c\":{\"value\":\"2024-03-05T03:04:05.000Z\"},\"Born__c\":{\"value\":\"1990-02-03\"},\"CreatedDate\":{\"value\":\"2020-01-02T00:00:00.000Z\"}}}]}}}}}"))
+    (let* ((thing (aref (gethash "GqlThing__c"
+                                 (cl-sf/objects:gql (GqlThing__c (edges (node Id (Name value) (Seen__c value)
+                                                                         (Born__c value) (CreatedDate value))))))
+                        0))
+           (slots (gethash (class-name (class-of thing)) cl-sf/objects:*sobject-slot-maps*)))
+      (flet ((slot (field) (slot-value thing (cdr (assoc field slots :test #'equal)))))
+        (is local-time:timestamp= (ts 2024 3 5 3 4 5) (slot "Seen__c"))
+        (is local-time:timestamp= (ts 1990 2 3) (slot "Born__c"))
+        (is local-time:timestamp= (ts 2020 1 2) (slot "CreatedDate"))
+        (is string= "T" (slot "Name"))))))
+
+(define-test temporal/select-style-records-have-timestamps
+  :parent temporal
+  ;; the REST /query shape: JSON strings with +0000, parsed by HASH->SOBJECT
+  (with-gql-org (requests)
+    (let* ((desc (find "GqlThing__c" *gql-org* :key (lambda (d) (gethash "name" d)) :test #'string=)))
+      (cl-sf/objects::%eval-define-sobject-class "GqlThing__c" desc)
+      (let* ((attrs (probe-hash "type" "GqlThing__c"))
+             (record (cl-sf/objects:hash->sobject
+                      (probe-hash "attributes" attrs "Id" "a01" "Seen__c" "2024-03-05T03:04:05.000+0000"
+                                  "CreatedDate" "2020-01-02T00:00:00.000+0000" "Born__c" 'null))))
+        (let ((slots (gethash (class-name (class-of record)) cl-sf/objects:*sobject-slot-maps*)))
+          (flet ((slot (field) (slot-value record (cdr (assoc field slots :test #'equal)))))
+            (is local-time:timestamp= (ts 2024 3 5 3 4 5) (slot "Seen__c"))
+            (is local-time:timestamp= (ts 2020 1 2) (slot "CreatedDate"))
+            (false (slot "Born__c"))))))))
+
+(define-test temporal/fast-timestamp-text-matches-local-times-formatter
+  :parent temporal
+  (let ((state (sb-ext:seed-random-state 7)) (mismatches '()))
+    (flet ((check (timestamp)
+             (dolist (kind '("date" "datetime" "time"))
+               (let ((fast (cl-sf/objects::%timestamp-text timestamp kind))
+                     (slow (cl-sf/objects::%timestamp-text-slow timestamp kind)))
+                 (unless (string= fast slow) (push (list kind fast slow) mismatches))))))
+      (dotimes (i 3000)                     ; instants from 1850 to 2400
+        (check (local-time:make-timestamp :day (+ -54000 (random 220000 state))
+                                          :sec (random 86400 state)
+                                          :nsec (random 1000000000 state))))
+      (loop for (year month day) in '((2000 2 29) (2000 3 1) (1999 12 31) (2100 2 28) (2100 3 1)
+                                      (1900 2 28) (1900 3 1) (2024 2 29) (1970 1 1) (1 1 1) (9999 12 31))
+            do (check (local-time:encode-timestamp 999999999 59 59 23 day month year :offset 0))
+               (check (local-time:encode-timestamp 0 0 0 0 day month year :offset 0))))
+    (is equal '() mismatches)))

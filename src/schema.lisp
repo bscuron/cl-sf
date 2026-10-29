@@ -109,20 +109,6 @@
                      ((eq kind :scalar) (return (gethash (string-upcase name) (gqt-types type))))
                      (t (return nil)))))))
 
-(defun %timestamp-text (timestamp kind)
-  "TIMESTAMP (a LOCAL-TIME:TIMESTAMP, taken as UTC) as the literal for a field
-   of describe type KIND: \"date\" → 2024-03-05, \"time\" → 03:04:05.000Z,
-   anything else (datetime) → 2024-03-05T03:04:05Z."
-  (local-time:format-timestring
-   nil timestamp :timezone local-time:+utc-zone+
-                 :format (cond ((equal kind "date")
-                                '((:year 4) #\- (:month 2) #\- (:day 2)))
-                               ((equal kind "time")
-                                '((:hour 2) #\: (:min 2) #\: (:sec 2) #\. (:msec 3) #\Z))
-                               (t
-                                '((:year 4) #\- (:month 2) #\- (:day 2) #\T
-                                  (:hour 2) #\: (:min 2) #\: (:sec 2) #\Z)))))
-
 (defun %soql-render-value-for (value from field)
   "Render the runtime VALUE of a SELECT condition on FIELD of sObject FROM
    (strings, as the macro saw them).  Like %SOQL-RENDER-VALUE, except that a

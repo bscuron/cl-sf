@@ -228,14 +228,16 @@
            (and (integerp loc) loc)))))
 
 (defun %csv-column-plan (record fields)
-  "Return (values class plan): for each of FIELDS (Salesforce API names), how
+  "Return (values class plan kinds): for each of FIELDS (Salesforce API names), how
    to read it from RECORD-shaped objects — the dedicated Id accessor (always
    works, including generic result objects with no raw data), a typed slot
    (by storage index when RECORD's class allows it), or SOBJECT-RAW.  The
    slot map is taken from RECORD's class, as every record in a job is the
-   same type."
+   same type.  KINDS holds, per column, \"date\" or \"datetime\" for a slot that
+   holds timestamps (so they are written the way Salesforce wants), else NIL."
   (let* ((class    (class-of record))
-         (slot-map (gethash (class-name class) *sobject-slot-maps*)))
+         (slot-map (gethash (class-name class) *sobject-slot-maps*))
+         (kind-map (gethash (class-name class) cl-sf/objects::*sobject-field-kinds*)))
     (values class
             (map 'simple-vector
                  (lambda (field)
@@ -246,7 +248,8 @@
                                        (list :slot loc (cdr pair) field)
                                        (list :slot-name (cdr pair) field))))
                            (t (list :raw field)))))
-                 fields))))
+                 fields)
+            (map 'simple-vector (lambda (field) (and kind-map (gethash field kind-map))) fields))))
 
 (declaim (inline %column-value))
 (defun %column-value (entry obj class)
@@ -277,12 +280,15 @@
            (%obuf-write-text buf (coerce field 'simple-string)))
   (%obuf-byte buf 10))
 
-(defun %write-csv-rows (buf records plan class)
-  (declare (type obuf buf) (type simple-vector plan))
+(defun %write-csv-rows (buf records plan class kinds)
+  (declare (type obuf buf) (type simple-vector plan kinds))
   (dolist (obj records)
     (dotimes (i (length plan))
       (when (> i 0) (%obuf-byte buf 44))
-      (%write-field buf (%column-value (svref plan i) obj class)))
+      (let ((value (%column-value (svref plan i) obj class)))
+        (%write-field buf (if (typep value 'local-time:timestamp)
+                              (cl-sf/objects::%timestamp-text value (or (svref kinds i) "datetime"))
+                              value))))
     (%obuf-byte buf 10)))
 
 (defun %bulk-column-names (records operation &optional external-id-field)
@@ -328,10 +334,10 @@
    larger lists are split into chunks written concurrently into their own
    buffers on lparallel workers, then joined with a single copy."
   (declare (type list records fields))
-  (multiple-value-bind (class plan)
+  (multiple-value-bind (class plan kinds)
       (if records
           (%csv-column-plan (car records) fields)
-          (values nil (vector)))
+          (values nil (vector) (vector)))
     (let* ((n          (length records))
            (ncols      (length fields))
            (chunk-size *bulk-csv-chunk-size*)
@@ -339,7 +345,7 @@
            (head       (%make-obuf (max 4096 (* (min n chunk-size) ncols 12)))))
       (%write-csv-header head fields)
       (if (<= n chunk-size)
-          (progn (%write-csv-rows head records plan class)
+          (progn (%write-csv-rows head records plan class kinds)
                  (%obuf-octets head))
           (let* ((rest   records)
                  (chunks (loop while rest
@@ -348,7 +354,7 @@
             (let* ((bufs  (lparallel:pmapcar
                            (lambda (chunk)
                              (let ((buf (%make-obuf (max 4096 (* (length chunk) ncols 12)))))
-                               (%write-csv-rows buf chunk plan class)
+                               (%write-csv-rows buf chunk plan class kinds)
                                buf))
                            chunks))
                    (total (+ (obuf-fill head) (reduce #'+ bufs :key #'obuf-fill)))
