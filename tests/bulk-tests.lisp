@@ -83,87 +83,157 @@ line2") "newline → needs quoting"))
     (true (char= #\" (char result 0)) "newline-containing value is quoted")))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; %csv-parse-line
+;;; %csv-select — byte-based CSV parser, builds only the named columns
 ;;; ──────────────────────────────────────────────────────────────────
 
-(define-test csv-parse-line/simple-fields
-  :parent bulk
-  (is equal '("a" "b" "c")
-      (cl-sf/bulk::%csv-parse-line "a,b,c")))
+(defun octets (string)
+  (sb-ext:string-to-octets string :external-format :utf-8))
 
-(define-test csv-parse-line/quoted-fields
-  :parent bulk
-  (is equal '("hello" "world")
-      (cl-sf/bulk::%csv-parse-line "\"hello\",world")))
+(defun csv-rows (string)
+  "STRING's data rows, every column, as lists of strings."
+  (let ((header (nth-value 1 (cl-sf/bulk::%csv-select (octets string) nil))))
+    (mapcar (lambda (row) (coerce row 'list))
+            (cl-sf/bulk::%csv-select (octets string) header))))
 
-(define-test csv-parse-line/embedded-quote
+(define-test csv-select/header-and-selected-columns
   :parent bulk
-  (is equal '("say \"hi\"" "ok")
-      (cl-sf/bulk::%csv-parse-line "\"say \"\"hi\"\"\",ok")
-      "\"\" inside quoted field → single double-quote"))
-
-(define-test csv-parse-line/empty-middle-field
-  :parent bulk
-  (is equal '("a" "" "b")
-      (cl-sf/bulk::%csv-parse-line "a,,b")
-      "consecutive commas → empty string field"))
-
-(define-test csv-parse-line/trailing-comma
-  :parent bulk
-  (is equal '("a" "b" "")
-      (cl-sf/bulk::%csv-parse-line "a,b,")
-      "trailing comma → final empty field"))
-
-(define-test csv-parse-line/single-field
-  :parent bulk
-  (is equal '("only")
-      (cl-sf/bulk::%csv-parse-line "only")))
-
-(define-test csv-parse-line/all-quoted
-  :parent bulk
-  (is equal '("001xx" "true")
-      (cl-sf/bulk::%csv-parse-line "\"001xx\",\"true\"")))
-
-;;; ──────────────────────────────────────────────────────────────────
-;;; %csv-parse
-;;; ──────────────────────────────────────────────────────────────────
-
-(define-test csv-parse/header-and-rows
-  :parent bulk
-  (multiple-value-bind (header rows)
-      (cl-sf/bulk::%csv-parse "sf__Id,sf__Created
-\"001xx\",\"true\"
-\"002xx\",\"false\"")
-    (is equal '("sf__Id" "sf__Created") header)
+  (multiple-value-bind (rows header)
+      (cl-sf/bulk::%csv-select
+       (octets (format nil "sf__Id,sf__Created,Name~%\"001xx\",\"true\",\"A\"~%\"002xx\",\"false\",\"B\"~%"))
+       '("Name" "sf__Id"))
+    (is equal '("sf__Id" "sf__Created" "Name") header)
     (is = 2 (length rows))
-    (is string= "001xx" (cdr (assoc "sf__Id"      (first rows) :test #'equal)))
-    (is string= "true"  (cdr (assoc "sf__Created" (first rows) :test #'equal)))))
+    (is equalp #("A" "001xx") (first rows))
+    (is equalp #("B" "002xx") (second rows))))
 
-(define-test csv-parse/empty-string
+(define-test csv-select/unknown-column-is-nil-and-short-row-is-empty
   :parent bulk
-  (multiple-value-bind (header rows)
-      (cl-sf/bulk::%csv-parse "")
-    (false header)
-    (false rows)))
+  (let ((rows (cl-sf/bulk::%csv-select (octets (format nil "a,b,c~%1,2~%")) '("c" "b" "nope"))))
+    (is equalp #("" "2" nil) (first rows))))
 
-(define-test csv-parse/header-only
+(define-test csv-select/empty-and-header-only
   :parent bulk
-  (multiple-value-bind (header rows)
-      (cl-sf/bulk::%csv-parse "sf__Id,sf__Created")
-    (is equal '("sf__Id" "sf__Created") header)
-    (false rows "No data rows")))
+  (multiple-value-bind (rows header) (cl-sf/bulk::%csv-select (octets "") '("a"))
+    (false rows) (false header))
+  (multiple-value-bind (rows header) (cl-sf/bulk::%csv-select (octets "sf__Id,sf__Created") '("sf__Id"))
+    (false rows)
+    (is equal '("sf__Id" "sf__Created") header)))
 
-(define-test csv-parse/crlf-line-endings
+(define-test csv-select/rfc4180-edge-cases
   :parent bulk
-  ;; NOTE: "\r\n" in a CL string literal is NOT a CRLF escape — backslash only
-  ;; escapes the next literal character, so that would read as "rn".  Build
-  ;; actual CR/LF via #\return #\newline.
-  (multiple-value-bind (header rows)
-      (cl-sf/bulk::%csv-parse
-       (format nil "Id,Name~C~C\"001\",\"Acme\"~C~C"
-               #\return #\newline #\return #\newline))
-    (is = 1 (length rows))
-    (is string= "Acme" (cdr (assoc "Name" (first rows) :test #'equal)))))
+  (flet ((check (expected string) (is equal expected (csv-rows string))))
+    (check '(("a" "he said \"hi\"" "c") ("d" "e" "f"))
+           (format nil "x,y,z~%a,\"he said \"\"hi\"\"\",c~%d,e,f~%"))
+    (check '(("a" "b" "") ("c" "d" ""))
+           (format nil "x,y,z~%a,b,~%c,d,~%"))
+    (check '(("" "" "") ("x" "" "y"))
+           (format nil "p,q,r~%,,~%x,,y~%"))
+    (check '(("a,b" "x
+y") ("z" "w"))
+           (format nil "p,q~%\"a,b\",\"x~%y\"~%z,w~%"))
+    (check '(("a" "") ("c" "d"))
+           (format nil "p,q~%\"a\",\"\"~%c,d~%"))
+    (check '(("a" "b")) (format nil "p,q~%a,b"))                ; no final newline
+    (check '(("a" "b")) (format nil "p,q~%\"a\",\"b\""))         ; ... quoted
+    (check '(("a" "b") ("c" "d")) (format nil "p,q~%a,b~%~%c,d~%"))   ; blank line
+    (check '(("café" "日本") ("naïve ☃" "x"))
+           (format nil "p,q~%café,日本~%\"naïve ☃\",x~%"))))
+
+(define-test csv-select/crlf-line-endings
+  :parent bulk
+  ;; NOTE: "\r\n" in a CL string literal is NOT a CRLF escape; build it.
+  (is equal '(("001" "Acme") ("002" "Beta"))
+      (csv-rows (format nil "Id,Name~C~C\"001\",\"Acme\"~C~C002,Beta~C~C"
+                        #\return #\newline #\return #\newline #\return #\newline))))
+
+(define-test csv-select/structure-spanning-simd-style-block-boundaries
+  :parent bulk
+  ;; quotes / escaped quotes / commas at every offset around 32 and 64 bytes
+  (dotimes (pad 70)
+    (let ((filler (make-string pad :initial-element #\x)))
+      (is equal (list (list (concatenate 'string filler "a\"b,c") "z"))
+          (csv-rows (format nil "p,q~%\"~Aa\"\"b,c\",z~%" filler))))))
+
+(define-test csv-select/round-trips-what-sobjects->csv-writes
+  :parent bulk
+  (let* ((labels (list "plain" "with, comma" (format nil "multi~%line") "say \"hi\"" "" "café ☃" "tail,\""))
+         (objs   (mapcar (lambda (l) (make-widget :label l :amount 1)) labels))
+         (csv    (cl-sf/bulk::%sobjects->csv objs '("Label__c" "Amount__c"))))
+    (is equal labels
+        (map 'list (lambda (row) (svref row 0))
+             (cl-sf/bulk::%csv-select (octets csv) '("Label__c"))))))
+
+(define-test csv-select/large-file
+  :parent bulk
+  (let* ((n 3000)
+         (csv (with-output-to-string (o)
+                (format o "Id,Name,Note~%")
+                (dotimes (i n) (format o "\"~D\",\"name ~D\",\"a,b~D\"~%" i i i))))
+         (rows (cl-sf/bulk::%csv-select (octets csv) '("Note" "Id"))))
+    (is = n (length rows))
+    (is equalp #("a,b2999" "2999") (car (last rows)))))
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; %build-bulk-result — correlating result CSVs back to input objects
+;;; ──────────────────────────────────────────────────────────────────
+
+(defmacro with-stubbed-results ((&key success failed unprocessed) &body body)
+  `(let ((saved (mapcar #'fdefinition '(cl-sf/bulk::get-successful-results
+                                        cl-sf/bulk::get-failed-results
+                                        cl-sf/bulk::get-unprocessed-results))))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'cl-sf/bulk::get-successful-results)
+                  (lambda (job-id &key conn) (declare (ignore job-id conn)) (octets ,success))
+                  (fdefinition 'cl-sf/bulk::get-failed-results)
+                  (lambda (job-id &key conn) (declare (ignore job-id conn)) (octets ,failed))
+                  (fdefinition 'cl-sf/bulk::get-unprocessed-results)
+                  (lambda (job-id &key conn) (declare (ignore job-id conn)) (octets ,unprocessed)))
+            ,@body)
+       (setf (fdefinition 'cl-sf/bulk::get-successful-results) (first saved)
+             (fdefinition 'cl-sf/bulk::get-failed-results) (second saved)
+             (fdefinition 'cl-sf/bulk::get-unprocessed-results) (third saved)))))
+
+(define-test build-bulk-result/update-matches-inputs-by-id
+  :parent bulk
+  (let* ((a (make-instance 'cl-sf/objects:sobject :id "001A" :type "Account"))
+         (b (make-instance 'cl-sf/objects:sobject :id "001B" :type "Account"))
+         (c (make-instance 'cl-sf/objects:sobject :id "001C" :type "Account")))
+    (with-stubbed-results
+        (:success (format nil "\"sf__Id\",\"sf__Created\",\"Name\"~%\"001A\",\"false\",\"x\"~%")
+         :failed (format nil "\"sf__Id\",\"sf__Error\",\"Name\"~%\"001B\",\"REQUIRED: oops, bad\",\"y\"~%")
+         :unprocessed (format nil "\"Id\",\"Name\"~%\"001C\",\"z\"~%"))
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "JOB1" (list a b c) :update "Account")))
+        (is string= "JOB1" (cl-sf/bulk:bulk-result-job-id result))
+        (is equal (list a) (cl-sf/bulk:bulk-result-successful result))
+        (is equal (list (cons b "REQUIRED: oops, bad")) (cl-sf/bulk:bulk-result-failed result))
+        (is = 1 (length (cl-sf/bulk:bulk-result-unprocessed result)))
+        (is string= "001C" (cl-sf/objects:sobject-id (first (cl-sf/bulk:bulk-result-unprocessed result))))))))
+
+(define-test build-bulk-result/insert-makes-fresh-objects-and-failures-have-no-input
+  :parent bulk
+  (with-stubbed-results
+      (:success (format nil "\"sf__Id\",\"sf__Created\"~%\"001N\",\"true\"~%\"001M\",\"true\"~%")
+       :failed (format nil "\"sf__Id\",\"sf__Error\"~%\"\",\"FIELD_INTEGRITY: nope\"~%")
+       :unprocessed "")
+    (let ((result (cl-sf/bulk::%build-bulk-result nil "JOB2" (list (make-widget :label "a")) :insert "Widget")))
+      (is equal '("001N" "001M")
+          (mapcar #'cl-sf/objects:sobject-id (cl-sf/bulk:bulk-result-successful result)))
+      (is string= "Widget" (cl-sf/objects:sobject-type (first (cl-sf/bulk:bulk-result-successful result))))
+      (is equal '((nil . "FIELD_INTEGRITY: nope")) (cl-sf/bulk:bulk-result-failed result))
+      (false (cl-sf/bulk:bulk-result-unprocessed result)))))
+
+(define-test build-bulk-result/upsert-created-flag-picks-fresh-or-input
+  :parent bulk
+  (let ((existing (make-instance 'cl-sf/objects:sobject :id "001E" :type "Account")))
+    (with-stubbed-results
+        (:success (format nil "\"sf__Id\",\"sf__Created\"~%\"001E\",\"false\"~%\"001N\",\"true\"~%")
+         :failed "" :unprocessed "")
+      (let* ((result (cl-sf/bulk::%build-bulk-result nil "JOB3" (list existing) :upsert "Account"))
+             (ok     (cl-sf/bulk:bulk-result-successful result)))
+        (true (eq existing (first ok)))
+        (is string= "001N" (cl-sf/objects:sobject-id (second ok)))
+        (false (eq existing (second ok)))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; %bulk-column-names

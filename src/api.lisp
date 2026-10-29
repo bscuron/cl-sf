@@ -92,6 +92,8 @@
 
 (defun %signal-api-error (body status)
   "Parse BODY as a Salesforce error response and signal SF-API-ERROR."
+  (when (typep body '(array (unsigned-byte 8) (*)))   ; :RAW :OCTETS requests
+    (setf body (babel:octets-to-string body :encoding :utf-8)))
   (multiple-value-bind (message code fields) (%parse-sf-errors body)
     (error 'sf-api-error
            :http-status status
@@ -117,7 +119,8 @@
    CONTENT-TYPE — HTTP Content-Type header for the body (default \"application/json\").
                   Pass \"text/csv\" for Bulk 2.0 data upload.
    RAW          — if T, return the raw response body string without JSON parsing.
-                  Use for endpoints that return CSV (Bulk 2.0 result downloads).
+                  If :OCTETS, return the body as a (simple-array (unsigned-byte 8))
+                  without decoding it (large CSV downloads: no string is built).
 
    Behaviour:
      • On HTTP 401: refreshes the access token and retries exactly once.
@@ -148,7 +151,8 @@
                      (dex:request url
                                   :method  method
                                   :headers headers
-                                  :content content)
+                                  :content content
+                                  :force-binary (eq raw :octets))
                    ;; dexador signals this on 4xx/5xx; we capture it to
                    ;; handle 401 (refresh + retry) vs other errors uniformly
                    (dex:http-request-failed (e)
@@ -171,11 +175,13 @@
          t)
         ;; Success — return raw string or parse as JSON
         ((and (>= status 200) (< status 300))
-         (if raw
-             (if (typep body '(array (unsigned-byte 8) (*)))
-                 (babel:octets-to-string body :encoding :utf-8)
-                 body)
-             (com.inuoe.jzon:parse body)))
+         (let ((bytes-p (typep body '(array (unsigned-byte 8) (*)))))
+           (cond ((eq raw :octets)
+                  (if bytes-p
+                      (coerce body '(simple-array (unsigned-byte 8) (*)))
+                      (sb-ext:string-to-octets body :external-format :utf-8)))
+                 (raw (if bytes-p (babel:octets-to-string body :encoding :utf-8) body))
+                 (t (com.inuoe.jzon:parse body)))))
         ;; Error
         (t
          (%signal-api-error body status))))))
