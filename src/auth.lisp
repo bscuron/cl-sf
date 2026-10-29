@@ -840,6 +840,102 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                        :client-secret client-secret)))
 
 ;;; ──────────────────────────────────────────────────────────────────
+;;; Saving a new login where the sf/sfdx CLI keeps it
+;;;
+;;; Same layout the CLI writes (checked against a real install):
+;;;   ~/.sfdx/<username>.json  accessToken/refreshToken AES-encrypted with
+;;;                            the key in ~/.sfdx/key.json, plus orgId,
+;;;                            instanceUrl, loginUrl, clientId, ...
+;;;   ~/.sfdx/alias.json       {"orgs": {alias: username}}
+;;; After this, CONNECT/CACHED-CREDENTIALS, the sf CLI and other tools see
+;;; the login, and token refreshes are written back (%PERSIST-REFRESHED-
+;;; CREDENTIALS).  Nothing is saved unless ~/.sfdx/key.json exists: without
+;;; the CLI's key we can't encrypt tokens in a form the CLI can read.
+;;; ──────────────────────────────────────────────────────────────────
+
+#+(and sbcl unix)
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-posix))
+
+(defun %fetch-userinfo (conn)
+  "GET /services/oauth2/userinfo — who CONN's access token belongs to."
+  (com.inuoe.jzon:parse
+   (dex:get (format nil "~A/services/oauth2/userinfo"
+                    (string-right-trim "/" (connection-instance-url conn)))
+            :headers `(("Authorization" . ,(format nil "Bearer ~A" (connection-access-token conn)))
+                       ("Accept" . "application/json")))))
+
+(defun %write-private-json-file (path data)
+  "Write DATA as JSON to PATH, creating directories; owner-only on Unix
+   (it holds tokens), like the CLI does."
+  (ensure-directories-exist path)
+  (%write-json-file path data)
+  #+(and sbcl unix) (sb-posix:chmod (uiop:native-namestring path) #o600))
+
+(defun %read-json-object-for-update (path)
+  "PATH's parsed JSON object, or a new empty one if PATH doesn't exist.
+   Signals SF-AUTH-ERROR if it exists but can't be read, rather than
+   letting a rewrite destroy it."
+  (cond ((not (uiop:file-exists-p path)) (make-hash-table :test #'equal))
+        ((%try-parse-json-file path))
+        (t (error 'sf-auth-error :message (format nil "~A exists but is not valid JSON." path)))))
+
+(defun %set-sfdx-alias (alias username)
+  (let* ((path (uiop:subpathname *sfdx-dir* "alias.json"))
+         (data (%read-json-object-for-update path))
+         (orgs (or (gethash "orgs" data)
+                   (setf (gethash "orgs" data) (make-hash-table :test #'equal)))))
+    (setf (gethash alias orgs) username)
+    (%write-private-json-file path data)))
+
+(defun %cli-timestamp ()
+  "Now, formatted the way the CLI stamps instanceApiVersionLastRetrieved
+   (e.g. \"10/28/2026, 12:48:59 AM\")."
+  (string-upcase
+   (local-time:format-timestring
+    nil (local-time:now)
+    :format '(:month "/" :day "/" :year ", " :hour12 ":" (:min 2) ":" (:sec 2) " " :ampm))))
+
+(defun %persist-new-login (conn &key alias)
+  "Save CONN (a fresh login) for the sf/sfdx CLI, as ~/.sfdx/<username>.json,
+   and map ALIAS to its username in ~/.sfdx/alias.json.  An existing file
+   for the same username is updated, keeping its other fields.  Sets
+   CONNECTION-USERNAME so later token refreshes are written back too.
+   Best-effort like %PERSIST-REFRESHED-CREDENTIALS: any failure (no key.json,
+   no write access, userinfo unreachable) is WARNed and the in-memory
+   CONN stays valid.  Returns the username, or NIL if nothing was saved."
+  (handler-case
+      (let* ((info     (%fetch-userinfo conn))
+             (username (or (gethash "preferred_username" info)
+                           (error 'sf-auth-error :message "userinfo has no username")))
+             (key      (%sfdx-encryption-key))
+             (path     (uiop:subpathname *sfdx-dir* (format nil "~A.json" username)))
+             (data     (%read-json-object-for-update path))
+             (instance (connection-instance-url conn)))
+        (flet ((put (k v) (setf (gethash k data) v)))
+          (put "accessToken" (%sfdx-encrypt (connection-access-token conn) key))
+          (when (connection-refresh-token conn)
+            (put "refreshToken" (%sfdx-encrypt (connection-refresh-token conn) key)))
+          (put "instanceUrl" instance)
+          (put "orgId" (gethash "organization_id" info))
+          (put "username" username)
+          (put "loginUrl" (connection-login-url conn))
+          (put "clientId" (connection-client-id conn))
+          (put "isDevHub" (gethash "isDevHub" data nil))
+          (put "instanceApiVersion" (string-left-trim "v" (connection-api-version conn)))
+          (put "instanceApiVersionLastRetrieved" (%cli-timestamp))
+          (put "isSandbox" (and (or (search "test.salesforce.com" (connection-login-url conn))
+                                    (search ".sandbox." instance))
+                                t))
+          (put "isScratch" (gethash "isScratch" data nil)))
+        (%write-private-json-file path data)
+        (when alias (%set-sfdx-alias alias username))
+        (setf (connection-username conn) username)
+        username)
+    (error (e)
+      (warn "cl-sf: logged in, but could not save the login for the sf CLI: ~A" e)
+      nil)))
+
+;;; ──────────────────────────────────────────────────────────────────
 ;;; connect/browser — Authorization Code flow with a local callback
 ;;; ──────────────────────────────────────────────────────────────────
 
@@ -911,7 +1007,9 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                              client-secret
                              (redirect-uri "http://localhost:1717/OauthRedirect")
                              (api-version "v62.0")
-                             (timeout 300))
+                             (timeout 300)
+                             alias
+                             (save t))
   "Authenticate interactively: open the system browser on Salesforce's
    login page, wait on a local port for the redirect, and exchange the
    code for tokens.  Returns a CONNECTION with a refresh token.
@@ -925,6 +1023,13 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                   web` uses).  Pass your own CLIENT-ID / CLIENT-SECRET /
                   REDIRECT-URI to use a different connected app.
    TIMEOUT      — seconds to wait for the browser before giving up.
+   SAVE         — when true (default), save the login where the sf/sfdx CLI
+                  keeps its own — ~/.sfdx/<username>.json, with ALIAS (if
+                  given) mapped in ~/.sfdx/alias.json — so
+                  CONNECT/CACHED-CREDENTIALS, the CLI and later Lisp
+                  sessions can reuse it.  Needs ~/.sfdx/key.json (the CLI's
+                  encryption key); without it a warning is issued and the
+                  login is kept in memory only.
 
    The redirect's port must be free on localhost (the port in
    REDIRECT-URI, 1717 by default)."
@@ -936,10 +1041,15 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
     (%open-browser url)
     (let ((code (%wait-for-oauth-redirect (or (quri:uri-port (quri:uri redirect-uri)) 80)
                                           state timeout)))
-      (connect/web-server-callback code
-                                   :client-id client-id :client-secret client-secret
-                                   :redirect-uri redirect-uri
-                                   :instance instance :api-version api-version))))
+      (let ((conn (connect/web-server-callback code
+                                               :client-id client-id :client-secret client-secret
+                                               :redirect-uri redirect-uri
+                                               :instance instance :api-version api-version)))
+        (when save
+          (let ((username (%persist-new-login conn :alias alias)))
+            (when username
+              (format t "~&Saved login for ~A~@[ (alias ~A)~] for the sf CLI.~%" username alias))))
+        conn))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; with-conn — the ergonomic entry point
@@ -978,7 +1088,8 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
     (or (gethash key *session-connections*)
         (setf (gethash key *session-connections*)
               (or (%cached-connection alias instance-url)
-                  (connect/browser :instance (or instance-url "https://login.salesforce.com")))))))
+                  (connect/browser :instance (or instance-url "https://login.salesforce.com")
+                                      :alias alias))))))
 
 (defun %with-conn-resolve (org)
   "Used by WITH-CONN: a CONNECTION is used as-is; a string (an sf/sfdx CLI
@@ -994,11 +1105,12 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
    Keywords — (with-conn :alias \"myorg\" :instance-url \"https://...\" body...)
      Uses the sf/sfdx CLI's cached login for :ALIAS if it has one.
      Otherwise opens your browser to log in to :INSTANCE-URL (default
-     https://login.salesforce.com) via CONNECT/BROWSER.  The connection is
-     kept for the rest of the Lisp session, so the browser opens at most
-     once per alias/instance.  A cached alias that belongs to a different
-     instance than :INSTANCE-URL is an error.  (The login is held in
-     memory; it is not written to the CLI's files.)
+     https://login.salesforce.com) via CONNECT/BROWSER, and saves the login
+     where the sf CLI keeps its own (~/.sfdx, with :ALIAS mapped to the
+     username) — so the next WITH-CONN, the CLI, and later Lisp sessions
+     find it in the cache and skip the browser.  The connection is also
+     kept for the rest of the Lisp session.  A cached alias that belongs
+     to a different instance than :INSTANCE-URL is an error.
 
    Positional — (with-conn ORG body...)
      ORG is a string (an sf/sfdx CLI alias or literal username, read from

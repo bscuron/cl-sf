@@ -396,3 +396,94 @@
   :parent auth
   (true (typep (sb-thread:join-thread (run-redirect-listener 17176 "st8" 1) :timeout 15)
                'cl-sf/auth:sf-auth-error)))
+
+;;; ── Saving a browser login for the sf CLI ─────────────────────────
+
+(defmacro with-sfdx-fixture ((sfdx-dir &key (key t) username) &body body)
+  "Run BODY with temp ~/.sf and ~/.sfdx dirs (SFDX-DIR bound to the latter),
+   a CLI-style key.json when KEY, and %FETCH-USERINFO stubbed to answer as
+   USERNAME in org 00Dxx0000000001."
+  `(let ((sf-dir (make-temp-dir)) (,sfdx-dir (make-temp-dir))
+         (orig (fdefinition 'cl-sf/auth::%fetch-userinfo)))
+     (unwind-protect
+          (let ((cl-sf/auth:*sf-dir* sf-dir) (cl-sf/auth:*sfdx-dir* ,sfdx-dir))
+            (when ,key
+              (write-fixture-json ,sfdx-dir "key.json"
+                                  (make-hash "account" "local" "service" "sfdx"
+                                             "key" "0123456789abcdef0123456789abcdef")))
+            (setf (fdefinition 'cl-sf/auth::%fetch-userinfo)
+                  (lambda (conn) (declare (ignore conn))
+                    (make-hash "preferred_username" ,username
+                               "organization_id" "00Dxx0000000001")))
+            ,@body)
+       (setf (fdefinition 'cl-sf/auth::%fetch-userinfo) orig)
+       (delete-temp-dir sf-dir) (delete-temp-dir ,sfdx-dir))))
+
+(defun fresh-login ()
+  (cl-sf/auth:make-connection :access-token "ACCESS-1" :refresh-token "REFRESH-1"
+                              :instance-url "https://my.my.salesforce.com"
+                              :login-url "https://login.salesforce.com"
+                              :client-id "PlatformCLI" :api-version "v62.0"))
+
+(define-test persist-new-login/round-trips-through-cached-credentials
+  :parent auth
+  (with-sfdx-fixture (sfdx-dir :username "me@example.com")
+    (let ((conn (fresh-login)))
+      (is string= "me@example.com" (cl-sf/auth::%persist-new-login conn :alias "org"))
+      (is string= "me@example.com" (cl-sf/auth:connection-username conn))
+      ;; the file looks like the CLI's: tokens are encrypted, metadata is plain
+      (let ((data (com.inuoe.jzon:parse
+                   (uiop:read-file-string (merge-pathnames "me@example.com.json" sfdx-dir)))))
+        (false (string= "ACCESS-1" (gethash "accessToken" data)))
+        (true (find #\: (gethash "accessToken" data)))
+        (is string= "00Dxx0000000001" (gethash "orgId" data))
+        (is string= "https://my.my.salesforce.com" (gethash "instanceUrl" data))
+        (is string= "PlatformCLI" (gethash "clientId" data))
+        (is string= "62.0" (gethash "instanceApiVersion" data))
+        (false (gethash "isSandbox" data))
+        (true (cl-ppcre:scan "^\\d+/\\d+/\\d{4}, \\d+:\\d\\d:\\d\\d (AM|PM)$"
+                             (gethash "instanceApiVersionLastRetrieved" data))))
+      ;; ...and a later session finds it by alias, tokens decrypted
+      (let ((again (cl-sf/auth:connect/cached-credentials :username "org")))
+        (is string= "ACCESS-1" (cl-sf/auth:connection-access-token again))
+        (is string= "REFRESH-1" (cl-sf/auth:connection-refresh-token again))
+        (is string= "https://my.my.salesforce.com" (cl-sf/auth:connection-instance-url again))))))
+
+(define-test persist-new-login/keeps-existing-fields-and-aliases
+  :parent auth
+  (with-sfdx-fixture (sfdx-dir :username "me@example.com")
+    (write-fixture-json sfdx-dir "me@example.com.json"
+                        (make-hash "orgEdition" "Developer Edition" "isDevHub" t))
+    (write-fixture-json sfdx-dir "alias.json" (make-hash "orgs" (make-hash "other" "x@y.com")))
+    (cl-sf/auth::%persist-new-login (fresh-login) :alias "org")
+    (let ((data  (com.inuoe.jzon:parse
+                  (uiop:read-file-string (merge-pathnames "me@example.com.json" sfdx-dir))))
+          (alias (com.inuoe.jzon:parse
+                  (uiop:read-file-string (merge-pathnames "alias.json" sfdx-dir)))))
+      (is string= "Developer Edition" (gethash "orgEdition" data))
+      (true (gethash "isDevHub" data))
+      (is string= "x@y.com" (gethash "other" (gethash "orgs" alias)))
+      (is string= "me@example.com" (gethash "org" (gethash "orgs" alias))))))
+
+(define-test persist-new-login/without-the-cli-key-saves-nothing
+  :parent auth
+  (with-sfdx-fixture (sfdx-dir :key nil :username "me@example.com")
+    (let ((conn (fresh-login)) (warned nil))
+      (handler-bind ((warning (lambda (w) (setf warned t) (muffle-warning w))))
+        (false (cl-sf/auth::%persist-new-login conn :alias "org")))
+      (true warned)
+      (false (uiop:file-exists-p (merge-pathnames "me@example.com.json" sfdx-dir)))
+      (false (uiop:file-exists-p (merge-pathnames "alias.json" sfdx-dir)))
+      ;; the in-memory connection is untouched
+      (is string= "ACCESS-1" (cl-sf/auth:connection-access-token conn)))))
+
+(define-test persist-new-login/refuses-to-overwrite-an-unreadable-alias-file
+  :parent auth
+  (with-sfdx-fixture (sfdx-dir :username "me@example.com")
+    (with-open-file (out (merge-pathnames "alias.json" sfdx-dir) :direction :output
+                         :if-exists :supersede)
+      (write-string "{not json" out))
+    (handler-bind ((warning #'muffle-warning))
+      (cl-sf/auth::%persist-new-login (fresh-login) :alias "org"))
+    (is string= "{not json"
+        (uiop:read-file-string (merge-pathnames "alias.json" sfdx-dir)))))
