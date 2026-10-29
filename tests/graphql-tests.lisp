@@ -14,9 +14,11 @@
   "A describe result: FIELDS plain field names; PARENTS (field relationship
    . referenceTo...) lookups; CHILDREN (relationship . child-sObject)."
   (let ((d (make-hash-table :test #'equal)))
-    (flet ((field (n &optional rel refs)
-             (let ((f (make-hash-table :test #'equal)))
+    (flet ((field (spec &optional rel refs)
+             (let ((f (make-hash-table :test #'equal))
+                   (n (if (consp spec) (car spec) spec)))
                (setf (gethash "name" f) n
+                     (gethash "type" f) (if (consp spec) (cdr spec) "string")
                      (gethash "relationshipName" f) (or rel 'null)
                      (gethash "referenceTo" f) (coerce refs 'vector))
                f))
@@ -36,12 +38,14 @@
 
 (defparameter *gql-org*
   (list (gql-describe "Account"
-                      :fields '("Id" "Name" "Industry" "AnnualRevenue" "My_Field__c" "Active__c")
+                      :fields '("Id" "Name" "Industry" "AnnualRevenue" "My_Field__c" "Active__c"
+                                ("CreatedDate" . "datetime"))
                       :parents '(("OwnerId" "Owner" "User") ("ParentId" "Parent" "Account"))
                       :children '(("Contacts" . "Contact") ("Opportunities" . "Opportunity")))
         (gql-describe "Contact"
                       :fields '("Id" "LastName" "Email")
                       :parents '(("AccountId" "Account" "Account")))
+        (gql-describe "Opportunity" :fields '("Id" "Name" ("CloseDate" . "date") ("Amount" . "currency")))
         (gql-describe "User" :fields '("Id" "Name" "Email"))
         (gql-describe "Group" :fields '("Id" "Name"))
         (gql-describe "Lead" :fields '("Id" "Company")
@@ -107,32 +111,32 @@
 (define-test gql/no-first-fetches-everything-in-pages
   :parent graphql
   (is string=
-      (wrap (format nil "Account(first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Account(first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account (edges (node Id))))))
 
 (define-test gql/names-are-recovered-from-metadata-in-any-case
   :parent graphql
   (is string=
-      (wrap (format nil "Account(where: {AnnualRevenue: {gt: 5}}, first: 2000) { edges { node { Id My_Field__c { value } Owner { Name { value } } } } ~A" *tail*))
+      (wrap (format nil "Account(where: {AnnualRevenue: {gt: 5}}, first: 2000, upperBound: 100000) { edges { node { Id My_Field__c { value } Owner { Name { value } } } } ~A" *tail*))
       (gql-text (account :where (annualrevenue (gt 5))
                   (edges (node id (my_field__c value) (owner (name value))))))))
 
 (define-test gql/a-string-name-is-used-exactly-as-written
   :parent graphql
   (is string=
-      (wrap (format nil "Account(first: 2000) { edges { node { Id Whatever__c { value } } } ~A" *tail*))
+      (wrap (format nil "Account(first: 2000, upperBound: 100000) { edges { node { Id Whatever__c { value } } } ~A" *tail*))
       (gql-text (Account (edges (node Id ("Whatever__c" value)))))))
 
 (define-test gql/alias
   :parent graphql
   (is string=
-      (wrap (format nil "big: Account(first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "big: Account(first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account :as "big" (edges (node Id))))))
 
 (define-test gql/children-take-their-own-arguments
   :parent graphql
   (is string=
-      (wrap (format nil "Account(first: 2000) { edges { node { Name { value } Contacts(first: 5, where: {Email: {like: \"%@x.com\"}}, orderBy: {LastName: {order: ASC}}) { edges { node { LastName { value } } } } } } ~A" *tail*))
+      (wrap (format nil "Account(first: 2000, upperBound: 100000) { edges { node { Name { value } Contacts(first: 5, where: {Email: {like: \"%@x.com\"}}, orderBy: {LastName: {order: ASC}}) { edges { node { LastName { value } } } } } } ~A" *tail*))
       (gql-text (Account (edges (node (Name value)
                                   (Contacts :first 5
                                             :where (Email (like "%@x.com"))
@@ -142,7 +146,7 @@
 (define-test gql/polymorphic-lookups-need-inline-fragments
   :parent graphql
   (is string=
-      (wrap (format nil "Lead(first: 2000) { edges { node { Owner { ... on User { Name { value } } ... on Group { Name { value } } __typename } } } ~A" *tail*))
+      (wrap (format nil "Lead(first: 2000, upperBound: 100000) { edges { node { Owner { ... on User { Name { value } } ... on Group { Name { value } } __typename } } } ~A" *tail*))
       (gql-text (Lead (edges (node (Owner (:on User (Name value))
                                           (:on Group (Name value))
                                           __typename)))))))
@@ -156,19 +160,19 @@
 (define-test gql/order-by-forms
   :parent graphql
   (is string=
-      (wrap (format nil "Account(orderBy: {Name: {order: DESC, nulls: LAST}}, first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Account(orderBy: {Name: {order: DESC, nulls: LAST}}, first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account :order-by (Name :desc :nulls :last) (edges (node Id)))))
   (is string=
-      (wrap (format nil "Account(orderBy: {Name: {order: DESC}, Id: {order: ASC}}, first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Account(orderBy: {Name: {order: DESC}, Id: {order: ASC}}, first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account :order-by ((Name :desc) (Id :asc)) (edges (node Id)))))
   (is string=
-      (wrap (format nil "Account(orderBy: {Name: {order: ASC}}, first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Account(orderBy: {Name: {order: ASC}}, first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account :order-by (Name (order :asc)) (edges (node Id))))))
 
 (defmacro where-text (filter)
   `(let ((text (gql-text (Account :where ,filter (edges (node Id))))))
      (subseq text (+ (length "query { uiapi { query { Account(where: ") 0)
-             (search ", first: 2000)" text))))
+             (search ", first: 2000, upperBound: 100000)" text))))
 
 (define-test gql/filters
   :parent graphql
@@ -186,7 +190,7 @@
 (define-test gql/filter-through-a-parent
   :parent graphql
   (is string=
-      (wrap (format nil "Contact(where: {Account: {Industry: {eq: \"Tech\"}}}, first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Contact(where: {Account: {Industry: {eq: \"Tech\"}}}, first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Contact :where (Account (Industry (eq "Tech"))) (edges (node Id))))))
 
 (define-test gql/values-come-from-the-surrounding-code-and-are-escaped
@@ -313,7 +317,7 @@
 (define-test gql/an-initial-after-cursor-is-sent
   :parent graphql
   (is string=
-      (wrap (format nil "Account(after: \"abc\", first: 2000) { edges { node { Id } } ~A" *tail*))
+      (wrap (format nil "Account(after: \"abc\", first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
       (gql-text (Account :after "abc" (edges (node Id))))))
 
 (define-test gql/graphql-errors-signal
@@ -330,3 +334,62 @@
   :parent graphql
   (let ((cl-sf/auth:*connection* nil))
     (fail (cl-sf/objects:gql (Account (edges (node Id)))) 'cl-sf/auth:sf-auth-error)))
+
+;;; ── Verified against a live org: dates, upperBound, error text ─────
+
+(define-test gql/date-and-datetime-operands-are-objects
+  :parent graphql
+  (is string= "{CreatedDate: {lt: {value: \"2100-01-01T00:00:00Z\"}}}"
+      (where-text (CreatedDate (lt "2100-01-01T00:00:00Z"))))
+  (is string= "{CreatedDate: {lte: {literal: TODAY}}}" (where-text (CreatedDate (lte :today))))
+  (is string= "{CreatedDate: {gte: {literal: LAST_WEEK}}}" (where-text (CreatedDate (gte :last-week))))
+  (is string= "{CreatedDate: {gte: {range: {last_n_days: 7}}}}"
+      (where-text (CreatedDate (gte (:range :last-n-days 7)))))
+  (is string= "{CreatedDate: {gte: {range: {n_days_ago: 30}}}}"
+      (where-text (CreatedDate (gte (:range :n-days-ago 30)))))
+  ;; a ready-made object is left alone
+  (is string= "{CreatedDate: {lt: {value: \"x\"}}}"
+      (where-text (CreatedDate (lt (:raw "{value: \"x\"}")))))
+  ;; a non-date field keeps its plain value
+  (is string= "{Name: {lt: \"2100\"}}" (where-text (Name (lt "2100")))))
+
+(define-test gql/timestamps-render-as-date-or-datetime-by-field-type
+  :parent graphql
+  (let ((ts (local-time:encode-timestamp 0 5 4 3 5 3 2024 :timezone local-time:+utc-zone+)))
+    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05Z\"}}}"
+        (where-text (CreatedDate (gt ts)))))
+  (let ((ts (local-time:encode-timestamp 0 5 4 3 5 3 2024 :timezone local-time:+utc-zone+)))
+    (is string= "Opportunity(where: {CloseDate: {gt: {value: \"2024-03-05\"}}}, first: 2000, upperBound: 100000) { edges { node { Id } } pageInfo { hasNextPage endCursor } }"
+        (subseq (gql-text (Opportunity :where (CloseDate (gt ts)) (edges (node Id))))
+                (length "query { uiapi { query { ")
+                (- (length (gql-text (Opportunity :where (CloseDate (gt ts)) (edges (node Id)))))
+                   (length " } } }"))))))
+
+(define-test gql/a-full-fetch-lifts-the-2000-record-cap
+  :parent graphql
+  (is string=
+      (wrap (format nil "Account(first: 2000, upperBound: 100000) { edges { node { Id } } ~A" *tail*))
+      (gql-text (Account (edges (node Id)))))
+  ;; your own :upper-bound replaces the default
+  (is string=
+      (wrap (format nil "Account(upperBound: 50, first: 2000) { edges { node { Id } } ~A" *tail*))
+      (gql-text (Account :upper-bound 50 (edges (node Id)))))
+  ;; an explicit :first is a single page: nothing is added
+  (is string=
+      (wrap (format nil "Account(first: 10) { edges { node { Id } } ~A" *tail*))
+      (gql-text (Account :first 10 (edges (node Id))))))
+
+(define-test gql/enum-keywords-use-underscores
+  :parent graphql
+  (is string=
+      (wrap (format nil "Account(scope: ASSIGNED_TO_ME, first: 10) { edges { node { Id } } ~A" *tail*))
+      (gql-text (Account :scope :assigned-to-me :first 10 (edges (node Id))))))
+
+(define-test gql/error-messages-are-unescaped
+  :parent graphql
+  (with-gql-org (requests :responses
+                          (list "{\"data\":{},\"errors\":[{\"message\":\"Field &#39;X__c&#39; in type &#39;Account&#39; is undefined &amp; &quot;bad&quot; &lt;b&gt;\"}]}"))
+    (let ((condition (handler-case (progn (cl-sf/objects:gql (Account (edges (node Id)))) nil)
+                       (cl-sf/api:sf-api-error (e) e))))
+      (true (search "Field 'X__c' in type 'Account' is undefined & \"bad\" <b>"
+                    (cl-sf/api:sf-api-error-message condition))))))

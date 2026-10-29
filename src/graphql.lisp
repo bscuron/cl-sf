@@ -69,12 +69,15 @@
   (cond ((or (stringp v) (numberp v)) `(list :value ,v))
         ((null v)     '(list :value nil))
         ((eq v t)     '(list :value t))
-        ((keywordp v) `(list :enum ,(symbol-name v)))
+        ((keywordp v) `(list :enum ,(substitute #\_ #\- (symbol-name v))))
         ((symbolp v)  (cond ((member (symbol-name v) '("TRUE" "FALSE" "NULL") :test #'string=)
                              `(list :raw ,(string-downcase (symbol-name v))))
                             ((%soql-variable-p v env) `(list :value ,v))
                             (t `(list :enum ,(symbol-name v)))))
         ((eq (car v) :raw) `(list :raw ,(second v)))
+        ((eq (car v) :range)
+         `(list :range ,(substitute #\_ #\- (string-downcase (symbol-name (second v))))
+                ,(%gql-value-form (third v) env)))
         ((consp v)    `(list :value ,v))
         (t (error "cl-sf: malformed gql value ~S" v))))
 
@@ -156,6 +159,7 @@
 (defstruct (gql-type (:conc-name gqt-))
   (name nil)
   (fields   (make-hash-table :test #'equal))    ; UPCASE → API name
+  (types    (make-hash-table :test #'equal))    ; UPCASE → describe type ("datetime", ...)
   (parents  (make-hash-table :test #'equal))    ; UPCASE → (relationship . referenceTo list)
   (children (make-hash-table :test #'equal)))   ; UPCASE → (relationship . child sObject)
 
@@ -180,7 +184,8 @@
     (loop for field across (gethash "fields" desc #())
           do (let ((n   (gethash "name" field))
                    (rel (gethash "relationshipName" field)))
-               (setf (gethash (string-upcase n) (gqt-fields type)) n)
+               (setf (gethash (string-upcase n) (gqt-fields type)) n
+                     (gethash (string-upcase n) (gqt-types type)) (gethash "type" field))
                (when (stringp rel)
                  (setf (gethash (string-upcase rel) (gqt-parents type))
                        (cons rel (coerce (gethash "referenceTo" field #()) 'list))))))
@@ -242,9 +247,15 @@
 ;;; ──────────────────────────────────────────────────────────────────
 
 (defparameter *gql-page-size* 2000
-  "Records per request when a top-level query gives no :first.
-   ponytail: Salesforce's maximum page size, from its docs as I read them —
-   lower it if the API rejects it.")
+  "Records per request when a top-level query gives no :first (Salesforce's
+   maximum: 2000, confirmed against a live org).")
+
+(defparameter *gql-upper-bound* 100000
+  "Without an upperBound, Salesforce stops paging at 2000 records in total.  A
+   query that fetches everything (no :first) therefore sends this, unless it
+   names its own :upper-bound.  ponytail: 100,000 is the ceiling I know of; the
+   API accepted much larger values on small results, so I couldn't confirm
+   where it really is — lower it if Salesforce rejects it.")
 
 (defun %gql-render-lisp (x)
   "A Lisp value as a GraphQL literal."
@@ -275,13 +286,39 @@
                 (map 'list #'%gql-render-lisp value)      ; includes an empty list → []
                 (mapcar #'%gql-value-text asts)))))
 
-(defun %gql-op-text (item)
+(defun %gql-date-text (ast field-type)
+  "AST as the operand of a date or datetime field, which GraphQL takes as an
+   object, not a bare value:  a string or timestamp → {value: ...};
+   :today → {literal: TODAY}; (:range :last-n-days 7) → {range: {last_n_days: 7}};
+   anything else (:raw, a ready-made object) is passed through."
+  (flet ((timestamp-text (ts)
+           (com.inuoe.jzon:stringify
+            (local-time:format-timestring
+             nil ts :timezone local-time:+utc-zone+
+                    :format (if (equal field-type "date")
+                                '((:year 4) #\- (:month 2) #\- (:day 2))
+                                '((:year 4) #\- (:month 2) #\- (:day 2) #\T
+                                  (:hour 2) #\: (:min 2) #\: (:sec 2) #\Z))))))
+    (case (car ast)
+      (:enum  (format nil "{literal: ~A}" (second ast)))
+      (:range (format nil "{range: {~A: ~A}}" (second ast) (%gql-value-text (third ast))))
+      (:value (let ((x (second ast)))
+                (typecase x
+                  (string (format nil "{value: ~A}" (%gql-render-lisp x)))
+                  (local-time:timestamp (format nil "{value: ~A}" (timestamp-text x)))
+                  (t (%gql-value-text ast)))))
+      (t (%gql-value-text ast)))))
+
+(defun %gql-op-text (item &optional field-type)
   (unless (eq (car item) :op)
     (%gql-error "a scalar field takes operators like (eq ...) or (in ...), not ~S" item))
   (destructuring-bind (op &rest values) (cdr item)
     (format nil "~A: ~A" op
             (cond ((member op *gql-array-operators* :test #'string=) (%gql-array-text values))
-                  ((and values (null (cdr values))) (%gql-value-text (first values)))
+                  ((and values (null (cdr values)))
+                   (if (member field-type '("date" "datetime") :test #'equal)
+                       (%gql-date-text (first values) field-type)
+                       (%gql-value-text (first values))))
                   (t (%gql-error "operator ~A takes exactly one value" op))))))
 
 (defun %gql-filter-text (f type conn)
@@ -296,7 +333,9 @@
            (format nil "{~A: ~A}" name
                    (ecase kind
                      ((:scalar :verbatim)
-                      (format nil "{~{~A~^, ~}}" (mapcar #'%gql-op-text items)))
+                      (let ((field-type (gethash (string-upcase name) (gqt-types type))))
+                        (format nil "{~{~A~^, ~}}"
+                                (mapcar (lambda (item) (%gql-op-text item field-type)) items))))
                      (:parent
                       (let* ((ptype (%gql-type conn (if (cdr data)
                                                          (%gql-error "~A is polymorphic; it cannot be filtered through" name)
@@ -403,7 +442,10 @@
                                args)
                            (and cursor `(("after" :value ,cursor)))
                            (and (not (gqs-limited-p state))
-                                `(("first" :value ,*gql-page-size*))))))
+                                `(("first" :value ,*gql-page-size*)))
+                           (and (not (gqs-limited-p state))
+                                (not (assoc "upperBound" args :test #'equal))
+                                `(("upperBound" :value ,*gql-upper-bound*))))))
       (format nil "~@[~A: ~]~A~A { ~A pageInfo { hasNextPage endCursor } }"
               alias (gqt-name type) (%gql-args-text args type conn)
               (format nil "~{~A~^ ~}"
@@ -414,10 +456,18 @@
   (format nil "query { uiapi { query { ~{~A~^ ~} } } }"
           (mapcar (lambda (state) (%gql-root-text state conn)) states)))
 
+(defun %html-unescape (string)
+  "Undo the HTML escaping Salesforce applies to GraphQL error messages."
+  (let ((s string))
+    (loop for (entity . char) in '(("&#39;" . "'") ("&quot;" . "\"") ("&lt;" . "<")
+                                    ("&gt;" . ">") ("&amp;" . "&"))
+          do (setf s (cl-ppcre:regex-replace-all (cl-ppcre:quote-meta-chars entity) s char)))
+    s))
+
 (defun %gql-errors-text (errors)
   (format nil "~{~A~^; ~}"
           (map 'list (lambda (e)
-                       (let ((message (gethash "message" e))
+                       (let ((message (%html-unescape (princ-to-string (gethash "message" e))))
                              (path (gethash "path" e)))
                          (if (and path (plusp (length path)))
                              (format nil "~A (at ~{~A~^.~})" message (coerce path 'list))
@@ -538,8 +588,11 @@
    inserts GraphQL text as written.  Names: bare symbols in any case (resolved
    from the org's metadata); a string is used exactly as written.
 
-   A top-level query without :first is fetched in full (*GQL-PAGE-SIZE* at a
-   time); with :first n, exactly one page of n.
+   A top-level query without :first is fetched in full, *GQL-PAGE-SIZE* at a
+   time and up to *GQL-UPPER-BOUND* records (or its own :upper-bound n); with
+   :first n (at most 2000) it is exactly one page.  Date and datetime fields
+   take (gte \"2024-01-01T00:00:00Z\") or a timestamp, a literal such as
+   (gte :last-week), or (gte (:range :last-n-days 7)).
 
    Example
      (with-conn \"myorg\"
