@@ -346,10 +346,12 @@
                      for sf-name = (gethash "name" field)
                      for sf-type = (gethash "type" field)
                      for temporal = (member sf-type '("date" "datetime") :test #'equal)
-                     ;; read-only dates (CreatedDate, LastModifiedDate, ...) get a
-                     ;; slot too, so they read as timestamps; writes skip them by name
-                     when (or temporal
-                              (not (member sf-name *sf-read-only-fields* :test #'equal)))
+                     ;; Every field gets a slot and so a <class>-<field> accessor,
+                     ;; read-only ones (CreatedDate, CreatedById, ...) included —
+                     ;; writes leave those out by name (*SF-READ-ONLY-FIELDS*).  Id
+                     ;; is the exception: it lives in SOBJECT's own slot, and
+                     ;; <class>-ID reads and sets that one (see DEFINE-SOBJECT-CLASS).
+                     unless (equal sf-name "Id")
                        collect (if temporal
                                    (list (intern (string-upcase sf-name)) sf-name :sf-type sf-type)
                                    (list (intern (string-upcase sf-name)) sf-name)))))
@@ -539,6 +541,16 @@
 ;;; define-sobject-class macro
 ;;; ──────────────────────────────────────────────────────────────────
 
+(defun %define-id-reader (reader)
+  "Make READER (<class>-ID) read and set the Id, as SOBJECT-ID does, so a class's
+   Id has an accessor named like its other fields.  The Id stays in SOBJECT's
+   one slot — there is no second copy to fall out of step.  A class that
+   defines its own ID slot keeps its own accessor."
+  (unless (fboundp reader)
+    (setf (fdefinition reader) #'sobject-id
+          (fdefinition (list 'setf reader)) (lambda (value object) (setf (sobject-id object) value))))
+  reader)
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun %field-initarg (slot-name)
     "The MAKE-INSTANCE keyword for a field's slot: its name, except where that
@@ -562,7 +574,9 @@
    text from Salesforce is parsed on the way in, and a timestamp is written
    back as text by SOBJECT->HASH-TABLE and the Bulk CSV writer.
 
-   Generated accessor name: <class-name>-<slot-name>
+   Generated accessor name: <class-name>-<slot-name>.  The Id needs no spec:
+   <class-name>-ID is defined for every class and reads (and, with SETF,
+   sets) SOBJECT-ID.
 
    Example:
      (define-sobject-class account \"Account\"
@@ -596,6 +610,7 @@
                                (declare (ignore _))
                                `(cons ,sf-name ',slot-name)))
                            field-specs)))
+         (id-reader (intern (format nil "~A-ID" class-name)))
          (temporal-fields
           (loop for (nil sf-name . options) in field-specs
                 for sf-type = (getf options :sf-type)
@@ -606,6 +621,8 @@
          (,@slot-defs)
          (:default-initargs :type ,sf-api-name)
          (:documentation ,(format nil "CLOS representation of Salesforce ~A." sf-api-name)))
+       ;; <class>-ID: the Id, under this class's own name
+       (%define-id-reader ',id-reader)
        ;; Register for HASH->SOBJECT dispatch
        (setf (gethash ,sf-api-name *sobject-classes*) (find-class ',class-name))
        ;; Register field↔slot mapping for conversion

@@ -601,8 +601,8 @@
            (kinds (gethash class-name cl-sf/objects::*sobject-field-kinds*)))
       (true (assoc "Seen__c" slots :test #'equal))
       (true (assoc "CreatedDate" slots :test #'equal) "a read-only datetime is readable")
-      (false (assoc "CreatedById" slots :test #'equal) "read-only non-dates stay out")
-      (false (assoc "Id" slots :test #'equal))
+      (true (assoc "CreatedById" slots :test #'equal) "so is any other read-only field")
+      (false (assoc "Id" slots :test #'equal) "Id lives in SOBJECT's own slot")
       (is string= "datetime" (gethash "CreatedDate" kinds))
       (is string= "date" (gethash "Born__c" kinds))
       (false (gethash "Name" kinds)))))
@@ -863,3 +863,64 @@
         (is = 1 (length (cl-sf/bulk:bulk-result-failed result)))
         (is eq ghost (car (first (cl-sf/bulk:bulk-result-failed result))))
         (true (search "INVALID_CROSS_REFERENCE_KEY" (cdr (first (cl-sf/bulk:bulk-result-failed result)))))))))
+
+;;; ── Every field, read-only ones too, has a <class>-<field> accessor ──
+
+(define-test accessors
+  :parent cl-sf/tests
+  :description "<class>-<field> readers for every field, including the Id and read-only fields.")
+
+(defun reader (class-name suffix)
+  (symbol-function (find-symbol (format nil "~A-~A" class-name suffix) (symbol-package class-name))))
+
+(define-test accessors/read-only-fields-have-class-specific-readers
+  :parent accessors
+  (with-gql-org (requests)
+    (let* ((class-name (gql-class "GqlThing__c"))
+           (thing (cl-sf/objects:hash->sobject
+                   (json "{\"attributes\":{\"type\":\"GqlThing__c\"},\"Id\":\"a01xx\",\"Name\":\"T\",
+                          \"CreatedById\":\"005xx\",\"CreatedDate\":\"2024-03-05T03:04:05.000+0000\"}"))))
+      (is string= "a01xx" (funcall (reader class-name "ID") thing) "<class>-id")
+      (is string= "T" (funcall (reader class-name "NAME") thing))
+      (is string= "005xx" (funcall (reader class-name "CREATEDBYID") thing) "a read-only field")
+      (is local-time:timestamp= (ts 2024 3 5 3 4 5) (funcall (reader class-name "CREATEDDATE") thing)
+          "a read-only datetime, as a timestamp"))))
+
+(define-test accessors/the-id-reader-is-the-base-slot-not-a-copy
+  :parent accessors
+  (with-gql-org (requests)
+    (let* ((class-name (gql-class "GqlThing__c"))
+           (thing (make-instance class-name)))
+      (false (funcall (reader class-name "ID") thing))
+      (setf (cl-sf/objects:sobject-id thing) "a01first")
+      (is string= "a01first" (funcall (reader class-name "ID") thing))
+      (funcall (fdefinition (list 'setf (find-symbol (format nil "~A-ID" class-name) (symbol-package class-name))))
+               "a01second" thing)
+      (is string= "a01second" (cl-sf/objects:sobject-id thing) "setting <class>-id sets SOBJECT-ID")
+      (false (assoc "Id" (gethash class-name cl-sf/objects:*sobject-slot-maps*) :test #'equal)))))
+
+(define-test accessors/hand-written-classes-get-an-id-reader-too
+  :parent accessors
+  (let ((contact (make-instance 'test-contact :id "003xx")))
+    (is string= "003xx" (test-contact-id contact))))
+
+(define-test accessors/read-only-fields-are-never-written
+  :parent accessors
+  (with-gql-org (requests)
+    (let* ((class-name (gql-class "GqlThing__c"))
+           (thing (make-instance class-name :name "T")))
+      (setf (slot-value thing (cdr (assoc "CreatedById" (gethash class-name cl-sf/objects:*sobject-slot-maps*)
+                                          :test #'equal)))
+            "005xx")
+      (setf (slot-value thing (cdr (assoc "CreatedDate" (gethash class-name cl-sf/objects:*sobject-slot-maps*)
+                                          :test #'equal)))
+            (ts 2024 1 1))
+      ;; single save, Collections record, and Bulk CSV all leave them out
+      (let ((body (cl-sf/objects:sobject->hash-table thing)))
+        (is string= "T" (gethash "Name" body))
+        (false (nth-value 1 (gethash "CreatedById" body)))
+        (false (nth-value 1 (gethash "CreatedDate" body))))
+      (let ((record (cl-sf/objects::%collection-record thing "GqlThing__c")))
+        (false (nth-value 1 (gethash "CreatedById" record))))
+      (false (member "CreatedById" (cl-sf/bulk::%bulk-column-names (list thing) :insert) :test #'equal))
+      (false (member "CreatedDate" (cl-sf/bulk::%bulk-column-names (list thing) :update) :test #'equal)))))
