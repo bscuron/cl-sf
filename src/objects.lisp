@@ -426,7 +426,7 @@
     (integer              (princ-to-string val))
     (real                 (let ((*read-default-float-format* 'double-float))
                             (prin1-to-string (float val 1d0))))
-    (local-time:timestamp (local-time:format-timestring nil val))
+    (local-time:timestamp (%timestamp-text val "datetime"))
     (list                 (format nil "(~{~A~^, ~})" (mapcar #'%soql-render-value val)))
     (vector               (%soql-render-value (coerce val 'list)))))
 
@@ -442,6 +442,14 @@
   (loop for (pl . more) on piece-lists
         append pl
         when more collect sep))
+
+(declaim (ftype function %timestamp-text))     ; schema.lisp, loaded after this file
+
+(defvar *soql-from* nil
+  "While a query is compiled: the sObject name of its FROM clause (a string).")
+(defvar *soql-field* nil
+  "While a condition's value is compiled: the field being compared (a string),
+   or NIL if the left side is not a plain field.")
 
 (defun %soql-kw= (x name)
   (and x (symbolp x) (string-equal (symbol-name x) name)))
@@ -500,13 +508,13 @@
     ((null v)     (list "NULL"))
     ((eq v t)     (list "TRUE"))
     ((symbolp v)  (if (%soql-variable-p v env)
-                      (list `(%soql-render-value ,v))
+                      (list `(%soql-render-value-for ,v ,*soql-from* ,*soql-field*))
                       (list (symbol-name v))))
     ((%soql-kw= (car v) "RAW")
      (unless (stringp (second v))
        (error "cl-sf: (RAW ...) takes a literal string, got ~S" v))
      (list (second v)))
-    ((consp v)    (list `(%soql-render-value ,v)))
+    ((consp v)    (list `(%soql-render-value-for ,v ,*soql-from* ,*soql-field*)))
     (t (error "cl-sf: malformed SOQL value: ~S" v))))
 
 (defun %soql-value-list (v env)
@@ -570,7 +578,9 @@
       (t (%soql-parse-comparison toks env)))))
 
 (defun %soql-parse-comparison (toks env)
-  (let* ((lhs  (%soql-item (pop toks)))
+  (let* ((field-token (first toks))
+         (lhs  (%soql-item (pop toks)))
+         (*soql-field* (and (symbolp field-token) (symbol-name field-token)))
          (op   (pop toks))
          (name (if (and op (symbolp op)) (symbol-name op)
                    (error "cl-sf: expected a SOQL operator after ~A, got ~S" lhs op))))
@@ -727,10 +737,13 @@
 (defun %soql-compile-query (toks env)
   "TOKS — a query after its implied SELECT.  Returns a flat piece list; used
    for the top-level query and for nested subqueries."
-  (%soql-interpose
-   (loop for (kw . ctoks) in (%soql-split-clauses toks)
-         collect (%soql-compile-clause kw ctoks env))
-   " "))
+  (let* ((clauses (%soql-split-clauses toks))
+         (from    (first (cdr (assoc "FROM" clauses :test #'string=))))
+         (*soql-from* (and (symbolp from) from (symbol-name from))))
+    (%soql-interpose
+     (loop for (kw . ctoks) in clauses
+           collect (%soql-compile-clause kw ctoks env))
+     " ")))
 
 (defun %soql-string (toks env)
   "A form that evaluates to the query text for TOKS (a constant string when

@@ -152,83 +152,6 @@
                (list ,@(%gql-arg-forms args env))
                (list ,@(mapcar (lambda (i) (%gql-selection-form i env)) selections)))))))
 
-;;; ──────────────────────────────────────────────────────────────────
-;;; Name resolution from describe metadata
-;;; ──────────────────────────────────────────────────────────────────
-
-(defstruct (gql-type (:conc-name gqt-))
-  (name nil)
-  (fields   (make-hash-table :test #'equal))    ; UPCASE → API name
-  (types    (make-hash-table :test #'equal))    ; UPCASE → describe type ("datetime", ...)
-  (parents  (make-hash-table :test #'equal))    ; UPCASE → (relationship . referenceTo list)
-  (children (make-hash-table :test #'equal)))   ; UPCASE → (relationship . child sObject)
-
-(defvar *gql-types* (make-hash-table :test #'equal :synchronized t)
-  "(instance-url . UPCASE-NAME) → GQL-TYPE.")
-
-(defun %gql-name (x)
-  (etypecase x (string x) (symbol (symbol-name x))))
-
-(defun %gql-error (control &rest args)
-  "A mistake in a gql form, found when the query is built: SF-API-ERROR, like
-   everything else that can go wrong running a query."
-  (error 'sf-api-error :message (format nil "gql: ~?" control args)))
-
-(defun %gql-build-type (conn name register-class)
-  (let* ((desc (handler-case (describe-sobject name :conn conn)
-                 (sf-api-error (e)
-                   (error 'sf-api-error
-                          :message (format nil "gql: cannot describe ~A: ~A"
-                                           name (sf-api-error-message e))))))
-         (type (make-gql-type :name (gethash "name" desc))))
-    (loop for field across (gethash "fields" desc #())
-          do (let ((n   (gethash "name" field))
-                   (rel (gethash "relationshipName" field)))
-               (setf (gethash (string-upcase n) (gqt-fields type)) n
-                     (gethash (string-upcase n) (gqt-types type)) (gethash "type" field))
-               (when (stringp rel)
-                 (setf (gethash (string-upcase rel) (gqt-parents type))
-                       (cons rel (coerce (gethash "referenceTo" field #()) 'list))))))
-    (loop for child across (gethash "childRelationships" desc #())
-          do (let ((rel (gethash "relationshipName" child)))
-               (when (stringp rel)
-                 (setf (gethash (string-upcase rel) (gqt-children type))
-                       (cons rel (gethash "childSObject" child))))))
-    ;; the records come back as this class: reuse the describe we already have
-    (when (and register-class (not (gethash (gqt-name type) *sobject-classes*)))
-      (%register-sobject-class conn (gqt-name type) desc))
-    type))
-
-(defun %gql-type (conn object &key register-class)
-  "The metadata for sObject OBJECT (a symbol or string, any case), cached per org."
-  (let ((key (cons (connection-instance-url conn) (string-upcase (%gql-name object)))))
-    (or (gethash key *gql-types*)
-        (setf (gethash key *gql-types*)
-              (%gql-build-type conn (%gql-name object) register-class)))))
-
-(defparameter *gql-pseudo-fields*
-  '(("__TYPENAME" . "__typename") ("APINAME" . "ApiName") ("WEAKETAG" . "WeakEtag"))
-  "Selectable on any record but absent from describe.")
-
-(defun %gql-lookup (type head)
-  "Resolve HEAD against TYPE → (values api-name kind data), KIND one of
-   :scalar :parent (DATA = referenceTo list) :child (DATA = child sObject)
-   :verbatim (HEAD was a string, used as written)."
-  (if (stringp head)
-      (values head :verbatim nil)
-      (let* ((u (string-upcase (symbol-name head)))
-             (field  (gethash u (gqt-fields type)))
-             (parent (gethash u (gqt-parents type)))
-             (child  (gethash u (gqt-children type)))
-             (pseudo (cdr (assoc u *gql-pseudo-fields* :test #'string=))))
-        (cond (field  (values field :scalar nil))
-              (parent (values (car parent) :parent (cdr parent)))
-              (child  (values (car child) :child (cdr child)))
-              (pseudo (values pseudo :scalar nil))
-              (t (error 'sf-api-error
-                        :message (format nil "gql: ~A has no field or relationship named ~A"
-                                         (gqt-name type) (symbol-name head))))))))
-
 (defparameter *gql-structural-names*
   '("edges" "node" "cursor" "pageInfo" "hasNextPage" "hasPreviousPage" "startCursor"
     "endCursor" "totalCount" "value" "displayValue" "label" "__typename")
@@ -266,7 +189,7 @@
     (keyword (symbol-name x))
     (integer (princ-to-string x))
     (real    (%soql-render-value x))
-    (local-time:timestamp (com.inuoe.jzon:stringify (local-time:format-timestring nil x)))
+    (local-time:timestamp (com.inuoe.jzon:stringify (%timestamp-text x "datetime")))
     (hash-table (format nil "{~{~A~^, ~}}"
                         (loop for k being the hash-keys of x using (hash-value v)
                               collect (format nil "~A: ~A" k (%gql-render-lisp v)))))
@@ -291,23 +214,17 @@
    object, not a bare value:  a string or timestamp → {value: ...};
    :today → {literal: TODAY}; (:range :last-n-days 7) → {range: {last_n_days: 7}};
    anything else (:raw, a ready-made object) is passed through."
-  (flet ((timestamp-text (ts)
-           (com.inuoe.jzon:stringify
-            (local-time:format-timestring
-             nil ts :timezone local-time:+utc-zone+
-                    :format (if (equal field-type "date")
-                                '((:year 4) #\- (:month 2) #\- (:day 2))
-                                '((:year 4) #\- (:month 2) #\- (:day 2) #\T
-                                  (:hour 2) #\: (:min 2) #\: (:sec 2) #\Z))))))
-    (case (car ast)
-      (:enum  (format nil "{literal: ~A}" (second ast)))
-      (:range (format nil "{range: {~A: ~A}}" (second ast) (%gql-value-text (third ast))))
-      (:value (let ((x (second ast)))
-                (typecase x
-                  (string (format nil "{value: ~A}" (%gql-render-lisp x)))
-                  (local-time:timestamp (format nil "{value: ~A}" (timestamp-text x)))
-                  (t (%gql-value-text ast)))))
-      (t (%gql-value-text ast)))))
+  (case (car ast)
+    (:enum  (format nil "{literal: ~A}" (second ast)))
+    (:range (format nil "{range: {~A: ~A}}" (second ast) (%gql-value-text (third ast))))
+    (:value (let ((x (second ast)))
+              (typecase x
+                (string (format nil "{value: ~A}" (%gql-render-lisp x)))
+                (local-time:timestamp
+                 (format nil "{value: ~A}"
+                         (com.inuoe.jzon:stringify (%timestamp-text x field-type))))
+                (t (%gql-value-text ast)))))
+    (t (%gql-value-text ast))))
 
 (defun %gql-op-text (item &optional field-type)
   (unless (eq (car item) :op)

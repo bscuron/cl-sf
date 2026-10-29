@@ -393,3 +393,88 @@
                        (cl-sf/api:sf-api-error (e) e))))
       (true (search "Field 'X__c' in type 'Account' is undefined & \"bad\" <b>"
                     (cl-sf/api:sf-api-error-message condition))))))
+
+;;; ── LOCAL-TIME timestamps in SELECT conditions ────────────────────
+
+(define-test temporal
+  :parent cl-sf/tests
+  :description "LOCAL-TIME values for date/datetime/time fields in select and gql.")
+
+(defparameter *ts*
+  (local-time:encode-timestamp 0 5 4 3 5 3 2024 :timezone local-time:+utc-zone+)
+  "2024-03-05 03:04:05 UTC")
+
+(defparameter *ts2*
+  (local-time:encode-timestamp 0 0 0 0 6 3 2024 :timezone local-time:+utc-zone+))
+
+(define-test temporal/select-renders-by-the-fields-type
+  :parent temporal
+  (with-gql-org (requests)
+    (let ((ts *ts*))
+      ;; datetime field → datetime literal
+      (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05Z"
+          (cl-sf/objects:soql select id from account where createddate > ts))
+      ;; date field → date literal
+      (is string= "SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE <= 2024-03-05"
+          (cl-sf/objects:soql select id from opportunity where closedate <= ts))
+      ;; a Lisp expression, not just a variable
+      (is string= "SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE = 2024-03-06"
+          (cl-sf/objects:soql select id from opportunity where closedate = (identity *ts2*)))
+      ;; through a relationship
+      (is string= "SELECT ID FROM CONTACT WHERE ACCOUNT.CREATEDDATE >= 2024-03-05T03:04:05Z"
+          (cl-sf/objects:soql select id from contact where account.createddate >= ts)))))
+
+(define-test temporal/select-renders-lists-of-timestamps
+  :parent temporal
+  (with-gql-org (requests)
+    (let ((days (list *ts* *ts2*)))
+      (is string= "SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE IN (2024-03-05, 2024-03-06)"
+          (cl-sf/objects:soql select id from opportunity where closedate in days)))))
+
+(define-test temporal/select-falls-back-to-a-datetime-when-the-type-is-unknown
+  :parent temporal
+  (let ((ts *ts*) (cl-sf/auth:*connection* nil))
+    ;; no connection at all (soql just builds text)
+    (is string= "SELECT ID FROM ACCOUNT WHERE CREATEDDATE > 2024-03-05T03:04:05Z"
+        (cl-sf/objects:soql select id from account where createddate > ts)))
+  (with-gql-org (requests)
+    (let ((ts *ts*))
+      ;; a field the org doesn't know, an object it doesn't know
+      (is string= "SELECT ID FROM ACCOUNT WHERE NOSUCH__C > 2024-03-05T03:04:05Z"
+          (cl-sf/objects:soql select id from account where nosuch__c > ts))
+      (is string= "SELECT ID FROM NOSUCHOBJECT__C WHERE X > 2024-03-05T03:04:05Z"
+          (cl-sf/objects:soql select id from nosuchobject__c where x > ts)))))
+
+(define-test temporal/select-only-looks-up-metadata-for-timestamps
+  :parent temporal
+  (let ((describes 0))
+    (with-gql-org (requests :describes describes)
+      (let ((name "Acme") (n 3) (ts *ts*))
+        (cl-sf/objects:soql select id from account where name = name and annualrevenue > n)
+        (is = 0 describes "strings and numbers never touch the schema")
+        (cl-sf/objects:soql select id from account where createddate > ts)
+        (cl-sf/objects:soql select id from account where createddate < ts)
+        (is = 1 describes "one describe, then cached")))))
+
+(define-test temporal/select-subquery-conditions-use-their-own-from
+  :parent temporal
+  (with-gql-org (requests)
+    (let ((ts *ts*))
+      (is string= "SELECT ID FROM CONTACT WHERE ACCOUNTID IN (SELECT ID FROM OPPORTUNITY WHERE CLOSEDATE < 2024-03-05)"
+          (cl-sf/objects:soql select id from contact
+                              where accountid in (select id from opportunity where closedate < ts))))))
+
+(define-test temporal/timestamp-text
+  :parent temporal
+  (is string= "2024-03-05" (cl-sf/objects::%timestamp-text *ts* "date"))
+  (is string= "2024-03-05T03:04:05Z" (cl-sf/objects::%timestamp-text *ts* "datetime"))
+  (is string= "03:04:05.000Z" (cl-sf/objects::%timestamp-text *ts* "time"))
+  ;; always UTC: 12:04:05 at UTC+9 is the same instant as 03:04:05 UTC
+  (let ((tokyo (local-time:encode-timestamp 0 5 4 12 5 3 2024 :offset 32400)))
+    (is string= "2024-03-05T03:04:05Z" (cl-sf/objects::%timestamp-text tokyo "datetime"))))
+
+(define-test temporal/gql-uses-the-same-literals
+  :parent temporal
+  (let ((ts *ts*))
+    (is string= "{CreatedDate: {gt: {value: \"2024-03-05T03:04:05Z\"}}}"
+        (where-text (CreatedDate (gt ts))))))

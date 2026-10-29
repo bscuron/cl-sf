@@ -23,7 +23,9 @@
                (:file "api")
                ;; TODO #5 — CLOS sObject definitions + public API wrappers
                (:file "objects")
-               ;; GraphQL front end (uses the describe/class machinery above)
+               ;; Cached describe metadata: names, relationships, field types
+               (:file "schema")
+               ;; GraphQL front end
                (:file "graphql")
                ;; TODO #4 — Bulk 2.0 API support
                (:file "bulk")
