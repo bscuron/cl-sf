@@ -73,7 +73,6 @@
                cl-sf/objects:database-update
                cl-sf/objects:database-upsert
                cl-sf/objects:database-delete
-               cl-sf/objects:sobject-join
                cl-sf/objects:describe-global
                cl-sf/objects:describe-sobject
                cl-sf/objects:limits)
@@ -145,7 +144,6 @@
                database-update
                database-upsert
                database-delete
-               sobject-join
                describe-global
                describe-sobject
                limits

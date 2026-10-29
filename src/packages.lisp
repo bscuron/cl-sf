@@ -130,8 +130,6 @@
    #:database-upsert
    #:database-delete
    #:*sf-read-only-fields*
-   ;; Client-side join (SOQL has no arbitrary JOIN)
-   #:sobject-join
    ;; Metadata (return raw hash-tables — structural, not record data)
    #:describe-global
    #:describe-sobject

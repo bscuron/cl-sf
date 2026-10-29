@@ -234,6 +234,34 @@
 ;;; Conversion: SOBJECT → hash-table
 ;;; ──────────────────────────────────────────────────────────────────
 
+(defvar *writable-slot-cache* (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "slot-map -> (read-only-list . slot-map entries that are not read-only).
+   A class's slot map is replaced (never mutated) when it is redefined, and
+   *SF-READ-ONLY-FIELDS* is compared by identity, so a stale entry can't be
+   returned.")
+
+(defvar *read-only-set-cache* (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "read-only field list -> EQUAL hash-table of its members.")
+
+(defun %read-only-set (list)
+  "LIST (normally *SF-READ-ONLY-FIELDS*) as a hash-set, for O(1) membership."
+  (or (gethash list *read-only-set-cache*)
+      (setf (gethash list *read-only-set-cache*)
+            (let ((set (make-hash-table :test #'equal)))
+              (dolist (field list set) (setf (gethash field set) t))))))
+
+(defun %writable-slots (slot-map)
+  "SLOT-MAP's (sf-name . slot-name) entries minus the read-only fields,
+   computed once per slot map instead of once per record."
+  (let ((cached (gethash slot-map *writable-slot-cache*))
+        (read-only *sf-read-only-fields*))
+    (if (and cached (eq (car cached) read-only))
+        (cdr cached)
+        (let* ((set     (%read-only-set read-only))
+               (entries (remove-if (lambda (entry) (gethash (car entry) set)) slot-map)))
+          (setf (gethash slot-map *writable-slot-cache*) (cons read-only entries))
+          entries))))
+
 (defun sobject->hash-table (obj)
   "Convert SOBJECT OBJ to a hash-table suitable for JSON serialisation.
 
@@ -243,25 +271,28 @@
      - Fields listed in *SF-READ-ONLY-FIELDS* are always excluded.
      - For typed objects: uses the registered slot map.
      - For generic SOBJECT instances: copies from SF-RAW minus read-only fields."
-  (let ((result    (make-hash-table :test #'equal))
-        (slot-map  (gethash (class-name (class-of obj)) *sobject-slot-maps*)))
+  (let ((slot-map (gethash (class-name (class-of obj)) *sobject-slot-maps*)))
     (if slot-map
         ;; ── Typed path ───────────────────────────────────────────────
-        (dolist (entry slot-map)
-          (let ((sf-name   (car entry))
-                (slot-name (cdr entry)))
-            (unless (member sf-name *sf-read-only-fields* :test #'equal)
-              (when (slot-boundp obj slot-name)
-                (let ((val (slot-value obj slot-name)))
-                  (when (not (null val))
-                    (setf (gethash sf-name result) val)))))))
+        (let* ((entries (%writable-slots slot-map))
+               (result  (make-hash-table :test #'equal :size (max 7 (length entries)))))
+          (dolist (entry entries result)
+            (let ((slot (cdr entry)))
+              (when (slot-boundp obj slot)
+                (let ((val (slot-value obj slot)))
+                  (when val
+                    (setf (gethash (car entry) result) val)))))))
         ;; ── Generic path: copy from sf-raw ──────────────────────────
-        (when (sobject-raw obj)
-          (maphash (lambda (k v)
-                     (unless (member k *sf-read-only-fields* :test #'equal)
-                       (setf (gethash k result) v)))
-                   (sobject-raw obj))))
-    result))
+        (let ((raw (sobject-raw obj)))
+          (if raw
+              (let ((result    (make-hash-table :test #'equal :size (max 7 (hash-table-count raw))))
+                    (read-only (%read-only-set *sf-read-only-fields*)))
+                (maphash (lambda (k v)
+                           (unless (gethash k read-only)
+                             (setf (gethash k result) v)))
+                         raw)
+                result)
+              (make-hash-table :test #'equal))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; define-sobject-class macro
@@ -752,74 +783,6 @@
     `(%select ,(%soql-string toks env) ,all-rows)))
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; Nested-loop join engine (backs SOBJECT-JOIN's :TEST path)
-;;; ──────────────────────────────────────────────────────────────────
-
-(defparameter *join-parallel-threshold* 20000
-  "LEFT-count * RIGHT-count above which a nested-loop join (%NESTED-LOOP-
-   JOIN, used by SOBJECT-JOIN's :TEST path) switches from
-   a sequential double loop to LPARALLEL:PMAPCAR chunked by LEFT row.
-   Benchmarked: dispatch overhead loses below ~10k row*candidate pairs,
-   wins 6-7x by ~1M pairs and up — this sits just above the loss zone.")
-
-(defun %nested-loop-join/sequential (left-list right-list condition-fn pair-fn type)
-  (let ((out '()))
-    (dolist (l left-list)
-      (let ((matches (remove-if-not (lambda (r) (funcall condition-fn l r)) right-list)))
-        (if matches
-            (dolist (r matches) (push (funcall pair-fn l r) out))
-            (when (member type '(:left :full)) (push (funcall pair-fn l nil) out)))))
-    (when (member type '(:right :full))
-      (dolist (r right-list)
-        (unless (some (lambda (l) (funcall condition-fn l r)) left-list)
-          (push (funcall pair-fn nil r) out))))
-    (nreverse out)))
-
-(defun %nested-loop-join/parallel (left-list right-list condition-fn pair-fn type)
-  "Same result as %NESTED-LOOP-JOIN/SEQUENTIAL, chunked across LPARALLEL
-   workers by LEFT element.  Each worker only reads shared state (RIGHT-
-   LIST, CONDITION-FN) and returns its own matches; the matched-RIGHT set
-   and final OUT list are built back in the calling thread afterward — no
-   mutable state is shared across worker threads while they run."
-  (cl-sf/auth::%ensure-lparallel-kernel)
-  (let ((per-left (lparallel:pmapcar
-                    (lambda (l)
-                      (list l (remove-if-not (lambda (r) (funcall condition-fn l r)) right-list)))
-                    left-list))
-        (out '())
-        (matched-right (make-hash-table :test #'eq)))
-    (dolist (entry per-left)
-      (destructuring-bind (l matches) entry
-        (if matches
-            (dolist (r matches)
-              (setf (gethash r matched-right) t)
-              (push (funcall pair-fn l r) out))
-            (when (member type '(:left :full)) (push (funcall pair-fn l nil) out)))))
-    (when (member type '(:right :full))
-      (dolist (r right-list)
-        (unless (gethash r matched-right)
-          (push (funcall pair-fn nil r) out))))
-    out))
-
-(defun %nested-loop-join (left right condition-fn pair-fn type)
-  "Shared O(n*m) join engine — no equality key to hash on, so every LEFT
-   element is compared against every RIGHT element via CONDITION-FN
-   (lambda (l r) boolean).  PAIR-FN (lambda (l r) -> output) builds one
-   output element from a match or an unmatched side (whichever of L/R is
-   NIL tells PAIR-FN which side was unmatched — :LEFT/:FULL call it with
-   R=NIL, :RIGHT/:FULL with L=NIL).  TYPE — :inner (default), :left,
-   :right, :full, same meaning as SOBJECT-JOIN.  Dispatches to a
-   sequential or LPARALLEL-parallel implementation based on
-   *JOIN-PARALLEL-THRESHOLD*."
-  (let* ((left-list  (coerce left 'list))
-         (right-list (coerce right 'list)))
-    (funcall (if (> (* (length left-list) (length right-list)) *join-parallel-threshold*)
-                 #'%nested-loop-join/parallel
-                 #'%nested-loop-join/sequential)
-             left-list right-list condition-fn pair-fn type)))
-
-
-;;; ──────────────────────────────────────────────────────────────────
 ;;; Public API — sObject CRUD
 ;;; ──────────────────────────────────────────────────────────────────
 
@@ -950,76 +913,6 @@ Did you mean DATABASE-INSERT?"))
       (when (gethash "id" result)
         (setf (sobject-id object) (gethash "id" result))))
     object))
-
-;;; ──────────────────────────────────────────────────────────────────
-;;; Client-side join — SOQL has no arbitrary JOIN (no cross-object joins
-;;; beyond its own parent/child relationship syntax).  SOBJECT-JOIN runs
-;;; one in Lisp against two already-queried record sets — typically two
-;;; SOQL results (lists, vectors, or LAZY-RESULT-SETs — anything LEFT-KEY/
-;;; RIGHT-KEY/TEST can read; MAP walks each at most once, so a lazy result
-;;; set stays lazy here too).
-;;; ──────────────────────────────────────────────────────────────────
-
-(defun %sobject-join/hash (left right left-key right-key type)
-  "Equi-join: O(n+m).  RIGHT is hashed once (bucketed by key, since a key
-   can match more than one row), then LEFT is matched against it in a
-   single pass."
-  (let ((index   (make-hash-table :test #'equal))
-        (matched (make-hash-table :test #'equal))
-        (pairs   '()))
-    (map nil (lambda (r) (push r (gethash (funcall right-key r) index))) right)
-    (map nil (lambda (l)
-               (let* ((k       (funcall left-key l))
-                      (matches (gethash k index)))
-                 (if matches
-                     (dolist (r matches)
-                       (setf (gethash k matched) t)
-                       (push (cons l r) pairs))
-                     (when (member type '(:left :full))
-                       (push (cons l nil) pairs)))))
-         left)
-    (when (member type '(:right :full))
-      (map nil (lambda (r)
-                 (unless (gethash (funcall right-key r) matched)
-                   (push (cons nil r) pairs)))
-           right))
-    (nreverse pairs)))
-
-(defun %sobject-join/nested-loop (left right test type)
-  "Arbitrary-predicate join: no equality key to hash on, so every LEFT row
-   is compared against every RIGHT row.  Dispatches to %NESTED-LOOP-JOIN
-   (shared with the SELECT...JOIN macro path), which parallelizes via
-   LPARALLEL above *JOIN-PARALLEL-THRESHOLD* row*candidate pairs.
-   ponytail: still O(n*m) even parallelized — add a range/interval index
-   for the specific predicate shape if that ceiling itself is the problem."
-  (%nested-loop-join left right test #'cons type))
-
-(defun sobject-join (left right &key left-key right-key test (type :inner))
-  "Join LEFT and RIGHT — two record sequences (e.g. results of separate
-   QUERY/SELECT calls) that SOQL itself can't JOIN across.
-
-   Pass LEFT-KEY and RIGHT-KEY for an equi-join (preferred — O(n+m)): each
-   is a function RECORD -> comparable key, compared with EQUAL.  RIGHT is
-   hashed once; pass the more selective/smaller side as RIGHT.
-
-   Pass TEST instead for a non-equality condition: a (LEFT-RECORD
-   RIGHT-RECORD) -> boolean function.  O(n*m) — only use when the join
-   really isn't an equality.
-
-   TYPE — :inner (default, matched pairs only), :left (every LEFT row at
-   least once; unmatched RIGHT is NIL), :right (every RIGHT row at least
-   once; unmatched LEFT is NIL), :full (both).
-
-   Returns a list of (LEFT-RECORD . RIGHT-RECORD) conses.
-
-   Example — match Contacts to Accounts from two independent queries:
-     (sobject-join (select Id Name FROM Account)
-                    (select Id Name AccountId FROM Contact)
-                    :left-key #'sobject-id :right-key #'contact-account-id
-                    :type :left)"
-  (if test
-      (%sobject-join/nested-loop left right test type)
-      (%sobject-join/hash left right left-key right-key type)))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Public API — metadata (pass-through; these return hash-tables)

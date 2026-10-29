@@ -697,3 +697,57 @@
     (with-stubbed-collection-api (log)
       (cl-sf/objects:database-upsert objs "Ext__c")
       (true (member '(:upsert-target "TestContact" "Ext__c") log :test #'equal)))))
+
+;;; ── sobject->hash-table caches ────────────────────────────────────
+
+(cl-sf/objects:define-sobject-class cache-probe "CacheProbe"
+  (alpha "Alpha__c")
+  (beta  "Beta__c")
+  (gamma "Gamma__c"))
+
+(define-test sobject->hash-table/unbound-and-nil-slots-are-omitted
+  :parent objects
+  (let ((o (make-instance 'cache-probe :alpha "a" :beta nil)))
+    (slot-makunbound o 'gamma)
+    (let ((h (cl-sf/objects:sobject->hash-table o)))
+      (is = 1 (hash-table-count h))
+      (is string= "a" (gethash "Alpha__c" h)))))
+
+(define-test sobject->hash-table/follows-changes-to-the-read-only-list
+  :parent objects
+  (let ((o (make-instance 'cache-probe :alpha "a" :beta "b")))
+    (is = 2 (hash-table-count (cl-sf/objects:sobject->hash-table o)))   ; primes the cache
+    (let ((cl-sf/objects:*sf-read-only-fields* (cons "Beta__c" cl-sf/objects:*sf-read-only-fields*)))
+      (let ((h (cl-sf/objects:sobject->hash-table o)))
+        (is = 1 (hash-table-count h))
+        (false (gethash "Beta__c" h))))
+    ;; and back again once the binding ends
+    (is = 2 (hash-table-count (cl-sf/objects:sobject->hash-table o)))))
+
+(define-test sobject->hash-table/follows-class-redefinition
+  :parent objects
+  (let ((o (make-instance 'cache-probe :alpha "a" :beta "b")))
+    (is = 2 (hash-table-count (cl-sf/objects:sobject->hash-table o)))
+    (unwind-protect
+         (progn
+           (cl-sf/objects:define-sobject-class cache-probe "CacheProbe"
+             (alpha "Alpha__c"))                       ; beta and gamma are gone
+           (let ((h (cl-sf/objects:sobject->hash-table (make-instance 'cache-probe :alpha "a"))))
+             (is = 1 (hash-table-count h))))
+      (cl-sf/objects:define-sobject-class cache-probe "CacheProbe"
+        (alpha "Alpha__c")
+        (beta  "Beta__c")
+        (gamma "Gamma__c")))))
+
+(define-test sobject->hash-table/generic-skips-read-only-keys
+  :parent objects
+  (let ((raw (make-hash-table :test #'equal)))
+    (setf (gethash "Name" raw) "n" (gethash "Id" raw) "x" (gethash "CreatedDate" raw) "d"
+          (gethash "attributes" raw) "a")
+    (let ((h (cl-sf/objects:sobject->hash-table
+              (make-instance 'cl-sf/objects:sobject :raw raw :type "X"))))
+      (is = 1 (hash-table-count h))
+      (is string= "n" (gethash "Name" h)))
+    ;; no raw data at all: an empty table, not an error
+    (is = 0 (hash-table-count
+             (cl-sf/objects:sobject->hash-table (make-instance 'cl-sf/objects:sobject :type "X"))))))
