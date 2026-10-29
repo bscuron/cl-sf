@@ -442,3 +442,224 @@ y") ("z" "w"))
     (slot-makunbound w 'cl-sf/tests::label)
     (is string= (format nil "Label__c~%~%")
         (csv-text (cl-sf/bulk::%sobjects->csv (list w) '("Label__c"))))))
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; Bulk latency: polling backoff, selective/parallel result downloads,
+;;; job creation overlapped with CSV generation (HTTP stubbed)
+;;; ──────────────────────────────────────────────────────────────────
+
+(defvar *bulk-log-lock* (sb-thread:make-mutex :name "bulk test log"))
+
+(defmacro bulk-log (item log)
+  `(sb-thread:with-mutex (*bulk-log-lock*) (push ,item ,log)))
+
+(defmacro with-fdefinitions ((&rest bindings) &body body)
+  "Temporarily replace each (NAME FUNCTION) global function binding."
+  `(let ((saved (mapcar (lambda (name) (fdefinition name)) ',(mapcar #'first bindings))))
+     (unwind-protect
+          (progn ,@(loop for (name fn) in bindings
+                         collect `(setf (fdefinition ',name) ,fn))
+                 ,@body)
+       (loop for name in ',(mapcar #'first bindings)
+             for fn in saved
+             do (setf (fdefinition name) fn)))))
+
+(defun job-status (state &key processed failed)
+  (let ((h (make-hash-table :test #'equal)))
+    (setf (gethash "state" h) state)
+    (when processed (setf (gethash "numberRecordsProcessed" h) processed))
+    (when failed (setf (gethash "numberRecordsFailed" h) failed))
+    h))
+
+;;; ── polling ──
+
+(define-test poll-job/backs-off-up-to-the-interval
+  :parent bulk
+  (let ((states (list "Open" "UploadComplete" "InProgress" "InProgress" "InProgress" "InProgress"
+                      "InProgress" "JobComplete"))
+        (sleeps '()))
+    (with-fdefinitions ((cl-sf/bulk::get-bulk-job
+                         (lambda (job-id &key conn) (declare (ignore job-id conn))
+                           (job-status (pop states)))))
+      (let ((final (cl-sf/bulk::%poll-job nil "J" :interval 5
+                                                  :sleep (lambda (s) (push s sleeps)))))
+        (is string= "JobComplete" (gethash "state" final))
+        (is equal '(0.5 1.0 2.0 4.0 5 5 5) (reverse sleeps))))))
+
+(define-test poll-job/finished-job-is-not-waited-for
+  :parent bulk
+  (let ((sleeps '()))
+    (with-fdefinitions ((cl-sf/bulk::get-bulk-job
+                         (lambda (job-id &key conn) (declare (ignore job-id conn))
+                           (job-status "JobComplete"))))
+      (cl-sf/bulk::%poll-job nil "J" :sleep (lambda (s) (push s sleeps)))
+      (is equal '() sleeps))))
+
+(define-test poll-job/small-interval-caps-the-first-wait
+  :parent bulk
+  (let ((states (list "InProgress" "JobComplete")) (sleeps '()))
+    (with-fdefinitions ((cl-sf/bulk::get-bulk-job
+                         (lambda (job-id &key conn) (declare (ignore job-id conn))
+                           (job-status (pop states)))))
+      (cl-sf/bulk::%poll-job nil "J" :interval 0.1 :sleep (lambda (s) (push s sleeps)))
+      (is equal '(0.1) sleeps))))
+
+(define-test poll-job/times-out
+  :parent bulk
+  (with-fdefinitions ((cl-sf/bulk::get-bulk-job
+                       (lambda (job-id &key conn) (declare (ignore job-id conn))
+                         (job-status "InProgress"))))
+    (fail (cl-sf/bulk::%poll-job nil "J" :timeout 0.05 :sleep (lambda (s) (declare (ignore s)) (sleep 0.02)))
+          'cl-sf/bulk:bulk-timeout-error)))
+
+;;; ── which result files, fetched how ──
+
+(define-test results-to-fetch/skips-files-that-must-be-empty
+  :parent bulk
+  (flet ((kinds (processed failed) (cl-sf/bulk::%results-to-fetch (job-status "JobComplete" :processed processed :failed failed))))
+    (is equal '(:successful) (kinds 10 0))
+    (is equal '(:successful :failed) (kinds 10 3))
+    (is equal '(:failed) (kinds 4 4))
+    (is equal '() (kinds 0 0)))
+  ;; no counts (or no status at all): fetch everything
+  (is equal '(:successful :failed :unprocessed) (cl-sf/bulk::%results-to-fetch (job-status "JobComplete")))
+  (is equal '(:successful :failed :unprocessed) (cl-sf/bulk::%results-to-fetch nil)))
+
+(defmacro with-result-downloads ((log &key (success "") (failed "") (unprocessed "") (delay 0)) &body body)
+  "Stub the three result downloads: log (kind thread) when called, sleep DELAY."
+  `(with-fdefinitions ((cl-sf/bulk::get-successful-results
+                        (lambda (job-id &key conn) (declare (ignore job-id conn))
+                          (bulk-log (list :successful sb-thread:*current-thread*) ,log)
+                          (sleep ,delay) (octets ,success)))
+                       (cl-sf/bulk::get-failed-results
+                        (lambda (job-id &key conn) (declare (ignore job-id conn))
+                          (bulk-log (list :failed sb-thread:*current-thread*) ,log)
+                          (sleep ,delay) (octets ,failed)))
+                       (cl-sf/bulk::get-unprocessed-results
+                        (lambda (job-id &key conn) (declare (ignore job-id conn))
+                          (bulk-log (list :unprocessed sb-thread:*current-thread*) ,log)
+                          (sleep ,delay) (octets ,unprocessed))))
+     ,@body))
+
+(define-test build-bulk-result/downloads-only-what-the-counts-call-for
+  :parent bulk
+  (let ((log '()))
+    (with-result-downloads (log :success (format nil "sf__Id,sf__Created~%001A,false~%"))
+      (let ((result (cl-sf/bulk::%build-bulk-result
+                     nil "J" (list (make-instance 'cl-sf/objects:sobject :id "001A" :type "Account"))
+                     :update "Account" (job-status "JobComplete" :processed 1 :failed 0))))
+        (is equal '(:successful) (mapcar #'first log))
+        (is = 1 (length (cl-sf/bulk:bulk-result-successful result)))
+        (false (cl-sf/bulk:bulk-result-failed result))
+        (false (cl-sf/bulk:bulk-result-unprocessed result))))))
+
+(define-test build-bulk-result/downloads-run-concurrently
+  :parent bulk
+  (let ((log '()))
+    (with-result-downloads (log :delay 0.3
+                                :success (format nil "sf__Id,sf__Created~%001A,true~%")
+                                :failed (format nil "sf__Id,sf__Error~%,boom~%"))
+      (let* ((start (get-internal-real-time))
+             (result (cl-sf/bulk::%build-bulk-result nil "J" '() :insert "Account"
+                                                     (job-status "JobComplete" :processed 2 :failed 1)))
+             (elapsed (/ (- (get-internal-real-time) start) internal-time-units-per-second)))
+        (is equal '(:failed :successful) (sort (mapcar #'first log) #'string<))
+        (is = 2 (length (remove-duplicates (mapcar #'second log))) "two different worker threads")
+        (true (< elapsed 0.55) "two 0.3 s downloads overlapped (serial would be 0.6 s)")
+        (is = 1 (length (cl-sf/bulk:bulk-result-successful result)))
+        (is equal '((nil . "boom")) (cl-sf/bulk:bulk-result-failed result))))))
+
+;;; ── the whole operation ──
+
+(defun stub-job-id (job) (gethash "id" job))
+
+(defun job (id)
+  (let ((h (make-hash-table :test #'equal))) (setf (gethash "id" h) id) h))
+
+(define-test run-bulk-operation/creates-the-job-while-the-csv-is-built
+  :parent bulk
+  (let ((log '()) (objs (list (make-widget :label "A" :amount 1))))
+    (with-fdefinitions ((cl-sf/bulk::create-bulk-job
+                         (lambda (type op &key conn external-id-field-name)
+                           (declare (ignore type op conn external-id-field-name))
+                           (bulk-log :create-start log)
+                           (sleep 0.3)
+                           (bulk-log :create-end log)
+                           (job "J1")))
+                        (cl-sf/bulk::%sobjects->csv
+                         (lambda (records fields) (declare (ignore records fields))
+                           (bulk-log :csv-start log)
+                           (sleep 0.05)
+                           (bulk-log :csv-end log)
+                           (octets "Label__c,Amount__c")))
+                        (cl-sf/api:api-request
+                         (lambda (method path &key conn body params content-type raw)
+                           (declare (ignore conn params content-type raw))
+                           (bulk-log (list :put method path (length body)) log) t))
+                        (cl-sf/bulk::close-bulk-job
+                         (lambda (id &key conn) (declare (ignore conn)) (bulk-log (list :close id) log) t))
+                        (cl-sf/bulk::get-bulk-job
+                         (lambda (id &key conn) (declare (ignore id conn))
+                           (job-status "JobComplete" :processed 1 :failed 0))))
+      (with-result-downloads (log :success (format nil "sf__Id,sf__Created~%001N,true~%"))
+        (let* ((result (cl-sf/bulk::%run-bulk-operation nil :insert objs))
+               (events  (reverse log))
+               (pos (lambda (event) (position event events :key (lambda (e) (if (consp e) (car e) e))))))
+          (true (< (funcall pos :create-start) (funcall pos :csv-end))
+                "job creation started before the CSV was finished")
+          (true (< (funcall pos :create-end) (funcall pos :put)) "upload waits for the job")
+          (is equal '(:put :post-ignored) (list :put :post-ignored))
+          (is string= "001N" (cl-sf/objects:sobject-id (first (cl-sf/bulk:bulk-result-successful result))))
+          (is string= "J1" (cl-sf/bulk:bulk-result-job-id result))
+          ;; the success-only job downloaded only the successful file
+          (is = 1 (count :successful events :key (lambda (e) (if (consp e) (car e) e)))))))))
+
+(define-test run-bulk-operation/a-failed-csv-aborts-the-job-that-was-created
+  :parent bulk
+  (let ((log '()))
+    (with-fdefinitions ((cl-sf/bulk::create-bulk-job
+                         (lambda (type op &key conn external-id-field-name)
+                           (declare (ignore type op conn external-id-field-name))
+                           (sleep 0.1) (job "J9")))
+                        (cl-sf/bulk::%sobjects->csv
+                         (lambda (records fields) (declare (ignore records fields))
+                           (error "cannot serialize")))
+                        (cl-sf/bulk::abort-bulk-job
+                         (lambda (id &key conn) (declare (ignore conn)) (bulk-log (list :abort id) log) t)))
+      (fail (cl-sf/bulk::%run-bulk-operation nil :insert (list (make-widget :label "A"))))
+      (is equal '((:abort "J9")) log))))
+
+(define-test run-bulk-operation/a-failed-job-creation-is-the-error-and-nothing-is-aborted
+  :parent bulk
+  (let ((log '()))
+    (with-fdefinitions ((cl-sf/bulk::create-bulk-job
+                         (lambda (type op &key conn external-id-field-name)
+                           (declare (ignore type op conn external-id-field-name))
+                           (error 'cl-sf/api:sf-api-error :message "no create")))
+                        (cl-sf/bulk::%sobjects->csv
+                         (lambda (records fields) (declare (ignore records fields)) (octets "x")))
+                        (cl-sf/bulk::abort-bulk-job
+                         (lambda (id &key conn) (declare (ignore conn)) (bulk-log (list :abort id) log) t)))
+      (fail (cl-sf/bulk::%run-bulk-operation nil :insert (list (make-widget :label "A")))
+            'cl-sf/api:sf-api-error)
+      (is equal '() log))))
+
+(define-test run-bulk-operation/a-failed-job-aborts-and-signals
+  :parent bulk
+  (let ((log '()))
+    (with-fdefinitions ((cl-sf/bulk::create-bulk-job
+                         (lambda (type op &key conn external-id-field-name)
+                           (declare (ignore type op conn external-id-field-name)) (job "J2")))
+                        (cl-sf/bulk::%sobjects->csv
+                         (lambda (records fields) (declare (ignore records fields)) (octets "x")))
+                        (cl-sf/api:api-request
+                         (lambda (method path &key conn body params content-type raw)
+                           (declare (ignore method path conn body params content-type raw)) t))
+                        (cl-sf/bulk::close-bulk-job (lambda (id &key conn) (declare (ignore id conn)) t))
+                        (cl-sf/bulk::get-bulk-job
+                         (lambda (id &key conn) (declare (ignore id conn)) (job-status "Failed")))
+                        (cl-sf/bulk::abort-bulk-job
+                         (lambda (id &key conn) (declare (ignore conn)) (bulk-log (list :abort id) log) t)))
+      (fail (cl-sf/bulk::%run-bulk-operation nil :insert (list (make-widget :label "A")))
+            'cl-sf/bulk:bulk-job-failed-error)
+      (is equal '((:abort "J2")) log))))

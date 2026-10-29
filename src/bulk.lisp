@@ -504,13 +504,17 @@
   "Return T if STATE is a terminal Bulk 2.0 job state."
   (member state '("JobComplete" "Failed" "Aborted") :test #'equal))
 
-(defun %poll-job (conn job-id &key (interval 5) (timeout 3600))
-  "Poll JOB-ID every INTERVAL seconds until a terminal state or TIMEOUT.
-   Called inside a LPARALLEL:FUTURE by %RUN-BULK-OPERATION.
-   Returns the final job status hash-table."
-  (let ((deadline (+ (get-universal-time) timeout)))
+(defun %poll-job (conn job-id &key (interval 5) (timeout 3600) (sleep #'sleep))
+  "Poll JOB-ID until it reaches a terminal state, or TIMEOUT seconds pass
+   (BULK-TIMEOUT-ERROR).  Waits between checks grow 0.5 s, 1 s, 2 s, ... up
+   to INTERVAL, so a job that finishes in seconds is noticed in seconds,
+   while a long one is polled every INTERVAL.  SLEEP is the wait function
+   (for tests).  Returns the final job status hash-table."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second)))
+        (delay 0.5))
     (loop
-      (when (> (get-universal-time) deadline)
+      (when (> (get-internal-real-time) deadline)
         (error 'bulk-timeout-error
                :job-id  job-id
                :timeout timeout
@@ -520,7 +524,8 @@
              (state  (gethash "state" status "")))
         (when (%bulk-job-terminal-p state)
           (return status))
-        (sleep interval)))))
+        (funcall sleep (min delay interval))
+        (setf delay (* delay 2))))))
 
 (defun create-bulk-job (sobject-type operation
                         &key (conn *connection*) (line-ending "LF") external-id-field-name)
@@ -611,27 +616,57 @@
 ;;; Result correlation
 ;;; ──────────────────────────────────────────────────────────────────
 
-(defun %build-bulk-result (conn job-id input-records operation sf-type)
-  "Fetch all three result CSVs and correlate them back to input sobjects.
+(defun %results-to-fetch (status)
+  "Which result files of a finished job are worth downloading, from its
+   STATUS counts: successful only if some record succeeded
+   (numberRecordsProcessed counts the failed ones too), failed only if some
+   failed.  Unprocessed records exist only for an aborted/failed job, which
+   never gets this far.  Without counts, fetch everything."
+  (let ((processed (and status (gethash "numberRecordsProcessed" status)))
+        (failed    (and status (gethash "numberRecordsFailed" status))))
+    (if (and (integerp processed) (integerp failed))
+        (append (when (> processed failed) '(:successful))
+                (when (> failed 0)         '(:failed)))
+        '(:successful :failed :unprocessed))))
+
+(defun %fetch-result-rows (conn job-id kinds)
+  "Download and parse the result files named by KINDS (:successful :failed
+   :unprocessed), concurrently when there is more than one.  Returns an
+   alist (kind . rows); each row is a vector of that file's needed columns."
+  (let* ((specs  '((:successful get-successful-results ("sf__Id" "sf__Created"))
+                   (:failed     get-failed-results     ("sf__Id" "sf__Error"))
+                   (:unprocessed get-unprocessed-results ("Id"))))
+         (wanted (remove-if-not (lambda (spec) (member (first spec) kinds)) specs))
+         (fetch  (lambda (spec)
+                   (cons (first spec)
+                         (%csv-select (funcall (second spec) job-id :conn conn)
+                                      (third spec))))))
+    (cond ((null wanted) nil)
+          ((null (cdr wanted)) (list (funcall fetch (first wanted))))
+          (t (cl-sf/auth::%ensure-lparallel-kernel)
+             (lparallel:pmapcar fetch wanted)))))
+
+(defun %build-bulk-result (conn job-id input-records operation sf-type &optional status)
+  "Fetch the result CSVs and correlate them back to input sobjects.  STATUS,
+   the finished job's status, lets files that must be empty be skipped
+   (see %RESULTS-TO-FETCH); without it all three are downloaded.
 
    For INSERT: successful rows → fresh sobjects with only Id set.
    For UPDATE/DELETE: successful rows → input sobjects matched by Id (O(n) hash-map).
    For UPSERT: mix of above based on sf__Created field.
    Failed rows → (nil . error-string) conses (no reliable back-matching for insert).
    Unprocessed rows → fresh generic sobjects."
-  (let ((success-rows (%csv-select (get-successful-results job-id :conn conn)
-                                   '("sf__Id" "sf__Created")))
-        (failed-rows  (%csv-select (get-failed-results job-id :conn conn)
-                                   '("sf__Id" "sf__Error")))
-        (unproc-rows  (%csv-select (get-unprocessed-results job-id :conn conn)
-                                   '("Id")))
-        ;; Id → input-object map for update/delete/upsert
-        (id->obj (when (member operation '(:update :delete :upsert))
-                   (let ((h (make-hash-table :test #'equal
-                                             :size (length input-records))))
-                     (dolist (obj input-records h)
-                       (when (sobject-id obj)
-                         (setf (gethash (sobject-id obj) h) obj)))))))
+  (let* ((fetched      (%fetch-result-rows conn job-id (%results-to-fetch status)))
+         (success-rows (cdr (assoc :successful fetched)))
+         (failed-rows  (cdr (assoc :failed fetched)))
+         (unproc-rows  (cdr (assoc :unprocessed fetched)))
+         ;; Id → input-object map for update/delete/upsert
+         (id->obj (when (member operation '(:update :delete :upsert))
+                    (let ((h (make-hash-table :test #'equal
+                                              :size (length input-records))))
+                      (dolist (obj input-records h)
+                        (when (sobject-id obj)
+                          (setf (gethash (sobject-id obj) h) obj)))))))
     (make-bulk-result
      :successful
      (loop for row in success-rows
@@ -683,24 +718,35 @@ DEFINE-SOBJECT-CLASS)."))
                             &key external-id-field
                                  (interval 5) (timeout 3600))
   "Orchestrate a complete Bulk 2.0 ingest operation.
-   1. Determine columns and serialize records to CSV.
-   2. Create job → upload CSV → signal UploadComplete.
-   3. Dispatch %POLL-JOB in a LPARALLEL:FUTURE (non-blocking poll loop).
-   4. FORCE the future (blocks until job finishes or times out).
-   5. On failure: signal BULK-JOB-FAILED-ERROR.
-   6. Fetch and correlate results; return BULK-RESULT.
+   1. Determine columns; start creating the job (a LPARALLEL:FUTURE) while
+      the records are serialized to CSV — the two are independent.
+   2. Upload the CSV → signal UploadComplete.
+   3. %POLL-JOB until the job finishes (backing off from 0.5 s to INTERVAL).
+   4. On job failure: signal BULK-JOB-FAILED-ERROR.
+   5. Download the needed result files in parallel; return a BULK-RESULT.
    On any error: attempt to abort the job before re-signaling."
   (let* ((sf-type  (%infer-sobject-type records))
          (columns  (%bulk-column-names records operation
                                        (when (eq operation :upsert)
                                          external-id-field)))
-         (csv      (%sobjects->csv records columns))
          (op-str   (string-downcase (symbol-name operation)))
-         ;; 1. Create job
-         (job      (create-bulk-job sf-type op-str
-                                    :conn conn
-                                    :external-id-field-name
-                                    (when (eq operation :upsert) external-id-field)))
+         (job-future
+           (progn
+             (cl-sf/auth::%ensure-lparallel-kernel)
+             (lparallel:future
+               (create-bulk-job sf-type op-str
+                                :conn conn
+                                :external-id-field-name
+                                (when (eq operation :upsert) external-id-field)))))
+         (csv      (handler-case (%sobjects->csv records columns)
+                     (error (e)
+                       ;; the job is being created anyway: don't leave it behind
+                       (handler-case
+                           (abort-bulk-job (gethash "id" (lparallel:force job-future))
+                                           :conn conn)
+                         (error ()))
+                       (error e))))
+         (job      (lparallel:force job-future))
          (job-id   (gethash "id" job)))
     (handler-case
         (progn
@@ -712,26 +758,22 @@ DEFINE-SOBJECT-CLASS)."))
                        :body         csv
                        :content-type "text/csv; charset=UTF-8"
                        :conn         conn)
-          ;; 3. Signal upload complete → Salesforce begins processing
+          ;; Signal upload complete → Salesforce begins processing
           (close-bulk-job job-id :conn conn)
-          ;; 4. Poll in a lparallel future — caller thread is free
-          (cl-sf/auth::%ensure-lparallel-kernel)
-          (let* ((poll-future (lparallel:future
-                                (%poll-job conn job-id
-                                           :interval interval
-                                           :timeout  timeout)))
-                 ;; 5. Block until done
-                 (final-status (lparallel:force poll-future))
+          ;; 3. Wait for the job to finish
+          (let* ((final-status (%poll-job conn job-id
+                                          :interval interval
+                                          :timeout  timeout))
                  (final-state  (gethash "state" final-status "")))
-            ;; 6. Check for job-level failure
+            ;; 4. Check for job-level failure
             (when (member final-state '("Failed" "Aborted") :test #'equal)
               (error 'bulk-job-failed-error
                      :job-id  job-id
                      :status  final-status
                      :message (format nil "Bulk job ~A entered state ~A"
                                       job-id final-state)))
-            ;; 7. Fetch + correlate results
-            (%build-bulk-result conn job-id records operation sf-type)))
+            ;; 5. Fetch + correlate results
+            (%build-bulk-result conn job-id records operation sf-type final-status)))
       ;; On any error, attempt a clean abort so the job doesn't linger
       (error (e)
         (handler-case (abort-bulk-job job-id :conn conn) (error ()))
