@@ -69,7 +69,6 @@
                cl-sf/objects:load-sobject-classes/openapi
                cl-sf/objects:soql
                cl-sf/objects:select
-               cl-sf/objects:gql
                cl-sf/objects:sobject-get
                cl-sf/objects:database-insert
                cl-sf/objects:database-update
@@ -152,7 +151,6 @@
                sobject->hash-table
                soql
                select
-               gql
                sobject-get
                database-insert
                database-update

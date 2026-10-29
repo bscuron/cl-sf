@@ -117,7 +117,7 @@
   "Parse the date or datetime Salesforce wrote in STRING into a
    LOCAL-TIME:TIMESTAMP, or return NIL if it isn't one.  Accepts 2024-03-05,
    2024-03-05T03:04:05Z, .123 fractions up to nanoseconds, and the offsets
-   Z, +0000, +00:00 and +00 (REST writes +0000, GraphQL writes Z).  A date
+   Z, +0000, +00:00 and +00 (REST writes +0000; others write Z).  A date
    is midnight UTC.  KIND (\"date\" or \"datetime\") only says whether a time
    part is expected: a date field ignores one."
   (declare (type string string))
