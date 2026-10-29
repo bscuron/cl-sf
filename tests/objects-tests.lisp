@@ -751,3 +751,66 @@
     ;; no raw data at all: an empty table, not an error
     (is = 0 (hash-table-count
              (cl-sf/objects:sobject->hash-table (make-instance 'cl-sf/objects:sobject :type "X"))))))
+
+;;; ── Writes honor each field's createable / updateable metadata ──
+
+(define-test field-access
+  :parent cl-sf/tests
+  :description "Fields Salesforce will not accept are left out of the write that would be rejected.")
+
+(cl-sf/objects:define-sobject-class access-thing "AccessThing__c"
+  (label    "Label__c")
+  (computed "Computed__c" :createable nil :updateable nil)
+  (once     "Once__c"     :updateable nil)
+  (later    "Later__c"    :createable nil))
+
+(defun access-thing-body (operation)
+  (let ((thing (make-instance 'access-thing :label "l" :computed "c" :once "o" :later "x")))
+    (sort (loop for k being the hash-keys of (cl-sf/objects:sobject->hash-table thing :operation operation)
+                collect k)
+          #'string<)))
+
+(define-test field-access/each-operation-sends-only-what-it-may
+  :parent field-access
+  (is equal '("Label__c" "Once__c")  (access-thing-body :insert))
+  (is equal '("Label__c" "Later__c") (access-thing-body :update))
+  (is equal '("Label__c")            (access-thing-body :upsert))
+  (is equal '("Label__c" "Later__c" "Once__c") (access-thing-body nil) "unknown: only the never-writable go"))
+
+(define-test field-access/collections-records-follow-the-operation
+  :parent field-access
+  (let ((thing (make-instance 'access-thing :label "l" :computed "c" :once "o" :later "x" :id "a00")))
+    (flet ((keys (operation)
+             (sort (loop for k being the hash-keys of (cl-sf/objects::%collection-record thing "AccessThing__c" :operation operation)
+                         unless (member k '("attributes" "Id") :test #'equal) collect k)
+                   #'string<)))
+      (is equal '("Label__c" "Once__c")  (keys :insert))
+      (is equal '("Label__c" "Later__c") (keys :update)))))
+
+(define-test field-access/bulk-columns-follow-the-operation
+  :parent field-access
+  (let ((things (list (make-instance 'access-thing :label "l"))))
+    (is equal '("Label__c" "Once__c")
+        (remove "Computed__c" (cl-sf/bulk::%bulk-column-names things :insert) :test #'equal)
+        "insert: no computed, no update-only")
+    (false (member "Computed__c" (cl-sf/bulk::%bulk-column-names things :insert) :test #'equal))
+    (false (member "Later__c" (cl-sf/bulk::%bulk-column-names things :insert) :test #'equal))
+    (false (member "Computed__c" (cl-sf/bulk::%bulk-column-names things :update) :test #'equal))
+    (false (member "Once__c" (cl-sf/bulk::%bulk-column-names things :update) :test #'equal))
+    (true (member "Later__c" (cl-sf/bulk::%bulk-column-names things :update) :test #'equal))))
+
+(define-test field-access/generated-classes-read-describe-flags
+  :parent field-access
+  (let* ((desc (alexandria:alist-hash-table
+                (list (cons "name" "GenAccess__c")
+                      (cons "fields"
+                            (vector (alexandria:alist-hash-table '(("name" . "Id") ("type" . "id") ("createable" . nil) ("updateable" . nil)) :test #'equal)
+                                    (alexandria:alist-hash-table '(("name" . "Name") ("type" . "string") ("createable" . t) ("updateable" . t)) :test #'equal)
+                                    (alexandria:alist-hash-table '(("name" . "Calc__c") ("type" . "string") ("createable" . nil) ("updateable" . nil)) :test #'equal)
+                                    (alexandria:alist-hash-table '(("name" . "Fixed__c") ("type" . "string") ("createable" . t) ("updateable" . nil)) :test #'equal))))
+                :test #'equal))
+         (class (cl-sf/objects::%eval-define-sobject-class "GenAccess__c" desc))
+         (access (gethash class cl-sf/objects::*sobject-field-access*)))
+    (is eq :read-only   (gethash "Calc__c" access))
+    (is eq :insert-only (gethash "Fixed__c" access))
+    (false (gethash "Name" access) "writable both ways: no entry")))

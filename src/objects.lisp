@@ -35,6 +35,13 @@
    \"datetime\", for the fields whose slots hold LOCAL-TIME timestamps.
    A class with no such fields has no entry.  Set by DEFINE-SOBJECT-CLASS.")
 
+(defvar *sobject-field-access* (make-hash-table :test #'eq)
+  "Maps class-name symbol → EQUAL hash-table of sf-field-name → :READ-ONLY
+   (neither createable nor updateable: computed and formula fields, Contact's
+   Name), :INSERT-ONLY (createable, not updateable) or :UPDATE-ONLY.  Only
+   restricted fields appear; a class with none has no entry.  Taken from the
+   org's describe metadata when a class is generated.")
+
 (defvar *sobject-slot-maps* (make-hash-table :test #'eq)
   "Maps class-name symbol → alist of (sf-field-name-string . slot-name-symbol).
    Used by HASH->SOBJECT to populate slots and by SOBJECT->HASH-TABLE to
@@ -314,6 +321,11 @@
    two threads (e.g. parallel bulk workers) that both first encounter a
    given sObject type at the same time.")
 
+(defun %describe-flag (field key)
+  "A boolean property of a describe FIELD, true when describe omits it."
+  (let ((v (gethash key field :absent)))
+    (or (eq v :absent) (eq v 'null) v)))
+
 (defun %define-relationship-readers (class-sym desc)
   "Define <CLASS-SYM>-<RELATIONSHIP> for every parent and child relationship of
    the describe result DESC, reading SOBJECT-RELATED: (user-contact user) is a
@@ -352,9 +364,10 @@
                      ;; is the exception: it lives in SOBJECT's own slot, and
                      ;; <class>-ID reads and sets that one (see DEFINE-SOBJECT-CLASS).
                      unless (equal sf-name "Id")
-                       collect (if temporal
-                                   (list (intern (string-upcase sf-name)) sf-name :sf-type sf-type)
-                                   (list (intern (string-upcase sf-name)) sf-name)))))
+                       collect (list* (intern (string-upcase sf-name)) sf-name
+                                      (append (when temporal (list :sf-type sf-type))
+                                              (unless (%describe-flag field "createable") '(:createable nil))
+                                              (unless (%describe-flag field "updateable") '(:updateable nil)))))))
     (%define-relationship-readers class-sym desc)
     class-sym))
 
@@ -488,31 +501,58 @@
             (let ((set (make-hash-table :test #'equal)))
               (dolist (field list set) (setf (gethash field set) t))))))
 
-(defun %writable-slots (slot-map)
-  "SLOT-MAP's (sf-name . slot-name) entries minus the read-only fields,
-   computed once per slot map instead of once per record."
+(defun %writable-on-p (access operation)
+  "Whether a field with ACCESS (NIL, or :READ-ONLY / :INSERT-ONLY / :UPDATE-ONLY)
+   may be sent in a write of OPERATION: :INSERT, :UPDATE, :UPSERT (a record
+   that may go either way, so the field must be writable both ways), or NIL
+   (unknown: anything writable somehow)."
+  (ecase operation
+    (:insert (not (member access '(:read-only :update-only))))
+    (:update (not (member access '(:read-only :insert-only))))
+    (:upsert (null access))
+    ((nil)   (not (eq access :read-only)))))
+
+(defun %writable-slots (slot-map class-name operation)
+  "SLOT-MAP's (sf-name . slot-name) entries that a write of OPERATION may send:
+   not in *SF-READ-ONLY-FIELDS*, and not restricted by the field's access in
+   *SOBJECT-FIELD-ACCESS*.  Computed once per slot map and operation."
   (let ((cached (gethash slot-map *writable-slot-cache*))
-        (read-only *sf-read-only-fields*))
-    (if (and cached (eq (car cached) read-only))
-        (cdr cached)
-        (let* ((set     (%read-only-set read-only))
-               (entries (remove-if (lambda (entry) (gethash (car entry) set)) slot-map)))
-          (setf (gethash slot-map *writable-slot-cache*) (cons read-only entries))
+        (read-only *sf-read-only-fields*)
+        (index (ecase operation ((nil) 0) (:insert 1) (:update 2) (:upsert 3))))
+    (unless (and cached (eq (car cached) read-only))
+      (setf cached (cons read-only (make-array 4 :initial-element :unset))
+            (gethash slot-map *writable-slot-cache*) cached))
+    (let ((entries (svref (cdr cached) index)))
+      (if (eq entries :unset)
+          (setf (svref (cdr cached) index)
+                (let ((set    (%read-only-set read-only))
+                      (access (gethash class-name *sobject-field-access*)))
+                  (remove-if (lambda (entry)
+                               (or (gethash (car entry) set)
+                                   (and access
+                                        (not (%writable-on-p (gethash (car entry) access) operation)))))
+                             slot-map)))
           entries))))
 
-(defun sobject->hash-table (obj)
+(defun sobject->hash-table (obj &key operation)
   "Convert SOBJECT OBJ to a hash-table suitable for JSON serialisation.
+   OPERATION — :INSERT, :UPDATE or :UPSERT — says what the body is for; the
+   writes in this library always say.
 
    Rules:
      - NIL slot values are omitted (Salesforce treats absent fields as
        unchanged on update, avoiding accidental nullification).
      - Fields listed in *SF-READ-ONLY-FIELDS* are always excluded.
+     - So are fields the org's metadata says cannot be written that way:
+       computed fields (Contact's Name, formulas) never; a field that is
+       createable but not updateable only for :UPDATE, and so on.  Without an
+       OPERATION only fields writable in neither way are left out.
      - For typed objects: uses the registered slot map.
      - For generic SOBJECT instances: copies from SF-RAW minus read-only fields."
   (let ((slot-map (gethash (class-name (class-of obj)) *sobject-slot-maps*)))
     (if slot-map
         ;; ── Typed path ───────────────────────────────────────────────
-        (let* ((entries (%writable-slots slot-map))
+        (let* ((entries (%writable-slots slot-map (class-name (class-of obj)) operation))
                (result  (make-hash-table :test #'equal :size (max 7 (length entries))))
                (kinds   (gethash (class-name (class-of obj)) *sobject-field-kinds*)))
           (dolist (entry entries result)
@@ -567,7 +607,11 @@
   "Define a CLOS class CLASS-NAME representing the Salesforce object SF-API-NAME.
    Registers the class in *SOBJECT-CLASSES* and its field map in *SOBJECT-SLOT-MAPS*.
 
-   FIELD-SPECS — list of (slot-name sf-field-name &key type documentation sf-type)
+   FIELD-SPECS — list of (slot-name sf-field-name &key type documentation sf-type
+                                                       createable updateable)
+   CREATEABLE / UPDATEABLE (default T) say whether Salesforce lets the field be
+   set on insert / update; writes leave a field out of a body it cannot be in.
+   Generated classes take them from the org's metadata.
    A field whose slot name is ID, TYPE or RAW is set with :ID-FIELD, :TYPE-FIELD
    or :RAW-FIELD (the plain keywords belong to SOBJECT itself).
    SF-TYPE \"date\" or \"datetime\" makes the slot hold a LOCAL-TIME:TIMESTAMP:
@@ -593,9 +637,9 @@
   (let* ((slot-defs
           (mapcar (lambda (spec)
                     (destructuring-bind (slot-name sf-name
-                                        &key (type t) documentation sf-type)
+                                        &key (type t) documentation sf-type createable updateable)
                         spec
-                      (declare (ignore sf-name sf-type))
+                      (declare (ignore sf-name sf-type createable updateable))
                       `(,slot-name
                         :initarg       ,(%field-initarg slot-name)
                         :accessor      ,(intern (format nil "~A-~A"
@@ -611,6 +655,14 @@
                                `(cons ,sf-name ',slot-name)))
                            field-specs)))
          (id-reader (intern (format nil "~A-ID" class-name)))
+         (restricted-fields
+           (loop for (nil sf-name . options) in field-specs
+                 for createable = (getf options :createable t)
+                 for updateable = (getf options :updateable t)
+                 unless (and createable updateable)
+                   collect (cons sf-name (cond ((not (or createable updateable)) :read-only)
+                                               ((not updateable) :insert-only)
+                                               (t :update-only)))))
          (temporal-fields
           (loop for (nil sf-name . options) in field-specs
                 for sf-type = (getf options :sf-type)
@@ -635,6 +687,14 @@
                            do (setf (gethash sf-name kinds) kind))
                      kinds))
             `(remhash ',class-name *sobject-field-kinds*))
+       ;; Which fields cannot be written every way (none: no entry)
+       ,(if restricted-fields
+            `(setf (gethash ',class-name *sobject-field-access*)
+                   (let ((access (make-hash-table :test #'equal)))
+                     (loop for (sf-name . restriction) in ',restricted-fields
+                           do (setf (gethash sf-name access) restriction))
+                     access))
+            `(remhash ',class-name *sobject-field-access*))
        ',class-name)))
 
 ;;; ──────────────────────────────────────────────────────────────────
@@ -1159,7 +1219,7 @@ but got both ~A and ~A." first-type type))))))))
                      (error 'sf-api-error
                             :message "SOBJECT instance has no type set — \
 cannot determine the Salesforce object type for create.")))
-         (result (cl-sf/api::%sobject-create conn type (sobject->hash-table object))))
+         (result (cl-sf/api::%sobject-create conn type (sobject->hash-table object :operation :insert))))
     (when (hash-table-p result)
       (setf (sobject-id  object) (gethash "id"   result)
             (sobject-raw object) (or (sobject-raw object)
@@ -1177,7 +1237,7 @@ Did you mean DATABASE-INSERT?"))
   (cl-sf/api::%sobject-update conn
                                (sobject-type object)
                                (sobject-id   object)
-                               (sobject->hash-table object))
+                               (sobject->hash-table object :operation :update))
   object)
 
 (defun %delete-one (object conn)
@@ -1207,7 +1267,7 @@ Did you mean DATABASE-INSERT?"))
                                         external-id-field object)))))
          (result (cl-sf/api::%sobject-upsert conn type
                                               external-id-field ext-id-value
-                                              (sobject->hash-table object))))
+                                              (sobject->hash-table object :operation :upsert))))
     (when (hash-table-p result)
       (when (gethash "id" result)
         (setf (sobject-id object) (gethash "id" result))))
@@ -1263,10 +1323,10 @@ Did you mean DATABASE-INSERT?"))
   (loop while list
         collect (loop repeat size while list collect (pop list))))
 
-(defun %collection-record (object type &key id)
-  "OBJECT as one Collections request record: its fields plus attributes.type
-   (and, for updates, Id)."
-  (let ((record (sobject->hash-table object))
+(defun %collection-record (object type &key id operation)
+  "OBJECT as one Collections request record: the fields OPERATION may write
+   plus attributes.type (and, for updates, Id)."
+  (let ((record (sobject->hash-table object :operation operation))
         (attributes (make-hash-table :test #'equal)))
     (setf (gethash "type" attributes) type
           (gethash "attributes" record) attributes)
@@ -1291,12 +1351,13 @@ Did you mean DATABASE-INSERT?"))
    vector of per-record results."
   (ecase operation
     (:insert (cl-sf/api::%collection-create
-              conn (mapcar (lambda (o) (%collection-record o type)) chunk)))
+              conn (mapcar (lambda (o) (%collection-record o type :operation :insert)) chunk)))
     (:update (cl-sf/api::%collection-update
-              conn (mapcar (lambda (o) (%collection-record o type :id (sobject-id o))) chunk)))
+              conn (mapcar (lambda (o) (%collection-record o type :id (sobject-id o) :operation :update))
+                           chunk)))
     (:upsert (cl-sf/api::%collection-upsert
               conn type external-id-field
-              (mapcar (lambda (o) (%collection-record o type)) chunk)))
+              (mapcar (lambda (o) (%collection-record o type :operation :upsert)) chunk)))
     (:delete (cl-sf/api::%collection-delete conn (mapcar #'sobject-id chunk)))))
 
 (defun %collection-dml (operation objects conn &key external-id-field)

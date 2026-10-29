@@ -309,12 +309,14 @@
 
 (defun %bulk-column-names (records operation &optional external-id-field)
   "Determine the ordered list of CSV column headers for an ingest job.
-   :INSERT  — all non-read-only fields, excluding Id
-   :UPDATE  — Id (required) + all non-read-only data fields
+   :INSERT  — all fields that can be set on insert, excluding Id
+   :UPDATE  — Id (required) + all fields that can be set on update
    :UPSERT  — all fields excluding read-only ones EXCEPT external-id-field
    :DELETE  — only Id"
   (let* ((first     (car records))
          (slot-map  (gethash (class-name (class-of first)) *sobject-slot-maps*))
+         (access    (and slot-map
+                         (gethash (class-name (class-of first)) cl-sf/objects::*sobject-field-access*)))
          (all-fields
           (if slot-map
               (mapcar #'car slot-map)
@@ -323,31 +325,31 @@
                 (loop for k being the hash-keys of (sobject-raw first)
                       unless (equal k "attributes")
                       collect k)))))
-    (ecase operation
+    (flet ((unwritable-p (f)
+             ;; read-only by name, or by the field's own metadata for this operation
+             (or (member f *sf-read-only-fields* :test #'equal)
+                 (and access
+                      (not (cl-sf/objects::%writable-on-p (gethash f access) operation))))))
+     (ecase operation
       (:delete
        '("Id"))
       (:insert
-       (remove-if (lambda (f)
-                    (member f *sf-read-only-fields* :test #'equal))
-                  all-fields))
+       (remove-if #'unwritable-p all-fields))
       (:update
-       (let ((data-fields
-              (remove-if (lambda (f)
-                           (or (equal f "Id")
-                               (member f *sf-read-only-fields* :test #'equal)))
-                         all-fields)))
+       (let ((data-fields (remove-if (lambda (f) (or (equal f "Id") (unwritable-p f)))
+                                     all-fields)))
          (list* "Id" data-fields)))
       (:upsert
        ;; The external-id field must be a column even if it would normally be
        ;; excluded — and \"Id\" never is in the slot map, so upserting on Id
        ;; used to send no Id at all and insert every row as new.
        (let ((columns (remove-if (lambda (f)
-                                   (and (member f *sf-read-only-fields* :test #'equal)
+                                   (and (unwritable-p f)
                                         (not (equal f external-id-field))))
                                  all-fields)))
          (if (or (null external-id-field) (member external-id-field columns :test #'equal))
              columns
-             (cons external-id-field columns)))))))
+             (cons external-id-field columns))))))))
 
 (defun %sobjects->csv (records fields)
   "Convert the list RECORDS to a Bulk 2.0 CSV with columns FIELDS, as an
