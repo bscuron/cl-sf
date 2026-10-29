@@ -674,15 +674,72 @@
         (write-char #\: out)
         (write-string cell out)))))
 
-(defun %upload-index (upload columns)
-  "UPLOAD (the CSV we sent, as octets) → a hash-table from each row's key to
-   the list of its row numbers, in upload order.  Rows are the records, in
-   the order they were given."
-  (let* ((rows  (coerce (%csv-select upload columns) 'simple-vector))
-         (index (make-hash-table :test #'equal :size (max 7 (length rows)))))
-    (loop for i from (1- (length rows)) downto 0
-          do (push i (gethash (%row-key (coerce (svref rows i) 'list)) index)))
-    index))
+(defun %canonical-number (cell)
+  "CELL, with a plain decimal number written canonically: no leading +, no
+   leading zeros, no trailing zeros after the point (\"1.50\", \"+1.5\", \"1.5\"
+   and \"001.500\" are all \"1.5\"; \"1000.0\" is \"1000\").  Anything that is
+   not such a number is returned unchanged.  Salesforce does this to the
+   numbers it echoes back."
+  (let* ((n (length cell))
+         (i (if (and (plusp n) (find (char cell 0) "+-")) 1 0))
+         (point (position #\. cell :start i)))
+    (if (and (< i n)
+             (every #'digit-char-p (subseq cell i point))
+             (plusp (- (or point n) i))
+             (or (null point) (every #'digit-char-p (subseq cell (1+ point)))))
+        (let* ((whole (string-left-trim "0" (subseq cell i point)))
+               (whole (if (string= whole "") "0" whole))
+               (fraction (if point (string-right-trim "0" (subseq cell (1+ point))) ""))
+               (zero (and (string= whole "0") (string= fraction "")))
+               (sign (if (and (char= (char cell 0) #\-) (not zero)) "-" "")))
+          (concatenate 'string sign whole (if (string= fraction "") "" ".") fraction))
+        cell)))
+
+(defun %relaxed-row-key (cells)
+  (%row-key (mapcar #'%canonical-number cells)))
+
+(defun %match-by-content (inputs upload columns rows complete-p)
+  "Match the result ROWS (each a list of cells, in the order of COLUMNS) to the
+   INPUTS (a vector of objects) whose uploaded row they echo.  UPLOAD is the
+   CSV that was sent.  Returns a vector parallel to ROWS holding the matched
+   object, or NIL.  Three passes, each only over what the last left:
+     1. the cells are identical (identical rows pair off in order);
+     2. identical once plain numbers are written canonically, because
+        Salesforce echoes 1.50 as 1.5;
+     3. by elimination: one input and one row left, and COMPLETE-P (every
+        input has a result row), so they can only belong together."
+  (let* ((uploaded (coerce (%csv-select upload columns) 'simple-vector))
+         (n        (min (length inputs) (length uploaded)))      ; they agree, but never run off either
+         (claimed  (make-array n :element-type 'bit :initial-element 0))
+         (matches  (make-array (length rows) :initial-element nil)))
+    (flet ((cells-of (i) (coerce (svref uploaded i) 'list))
+           (claim (k i) (setf (svref matches k) (svref inputs i)
+                              (sbit claimed i) 1))
+           (index-by (key-fn)
+             (let ((index (make-hash-table :test #'equal :size (max 7 n))))
+               (loop for i from (1- n) downto 0
+                     do (when (zerop (sbit claimed i))
+                          (push i (gethash (funcall key-fn (coerce (svref uploaded i) 'list)) index))))
+               index)))
+      ;; 1. exact
+      (let ((index (index-by #'%row-key)))
+        (loop for row in rows for k from 0
+              do (let ((i (pop (gethash (%row-key row) index))))
+                   (when i (claim k i)))))
+      ;; 2. numbers canonicalized, over the leftovers
+      (when (position nil matches)
+        (let ((index (index-by #'%relaxed-row-key)))
+          (loop for row in rows for k from 0
+                do (unless (svref matches k)
+                     (let ((i (pop (gethash (%relaxed-row-key row) index))))
+                       (when i (claim k i)))))))
+      ;; 3. elimination
+      (when complete-p
+        (let ((open-rows   (loop for k from 0 below (length rows) unless (svref matches k) collect k))
+              (open-inputs (loop for i from 0 below n when (zerop (sbit claimed i)) collect i)))
+          (when (and open-rows (null (cdr open-rows)) open-inputs (null (cdr open-inputs)))
+            (claim (first open-rows) (first open-inputs)))))
+      (values matches (lambda (i) (cells-of i))))))
 
 (defun %build-bulk-result (conn job-id input-records operation sf-type
                            &key status upload columns)
@@ -693,10 +750,10 @@
    UPDATE/DELETE: rows match their input object by Id (O(n) hash-map).
    INSERT (and UPSERT rows with no Id of their own): the result files echo
    the columns we uploaded, so UPLOAD and COLUMNS — the CSV and its header —
-   let each result row be matched to the object whose row has the same cells.
-   Identical rows are paired in order, which is harmless.  The object gets
-   the new Id and is what the result holds.  A row that cannot be matched
-   (or any row, if UPLOAD is NIL) is a fresh SOBJECT with only the Id.
+   let each result row be matched to the object whose row has the same cells
+   (see %MATCH-BY-CONTENT).  The object gets the new Id and is what the
+   result holds.  A row that cannot be matched (or any row, if UPLOAD is NIL)
+   is a fresh SOBJECT with only the Id.
    Failed rows are (object . error-string), the object NIL if unmatched.
    Unprocessed rows are fresh generic sobjects."
   (let* ((fetched      (%fetch-result-rows conn job-id (%results-to-fetch status) columns))
@@ -704,8 +761,7 @@
          (failure      (cdr (assoc :failed fetched)))
          (unproc-rows  (cddr (assoc :unprocessed fetched)))
          (inputs       (coerce input-records 'simple-vector))
-         (index        (when (and upload columns (member operation '(:insert :upsert)))
-                         (%upload-index upload columns)))
+         (content-p    (and upload columns (member operation '(:insert :upsert)) t))
          ;; Id → input-object map for update/delete/upsert
          (id->obj (when (member operation '(:update :delete :upsert))
                     (let ((h (make-hash-table :test #'equal :size (max 7 (length inputs)))))
@@ -716,45 +772,63 @@
     (labels ((cell (row names name)
                (let ((i (position name names :test #'string=)))
                  (and i (svref row i))))
-             (by-content (row names)
-               ;; the object whose uploaded row has the same cells, claimed once
-               (when index
-                 (let* ((key (%row-key (mapcar (lambda (column) (cell row names column)) columns)))
-                        (i   (pop (gethash key index))))
-                   (and i (svref inputs i)))))
-             (nonblank (id) (and id (plusp (length id)) id)))
-      (make-bulk-result
-       :successful
-       (loop with names = (car success)
-             for row in (cdr success)
-             for sf-id   = (cell row names "sf__Id")
-             for created = (cell row names "sf__Created")
-             collect
-             (let ((object
-                     (or (and id->obj sf-id (not (and (eq operation :upsert) (equal created "true")))
-                              (gethash sf-id id->obj))
-                         (by-content row names))))
-               (cond (object
-                      ;; an inserted (or upsert-created) object learns its Id
-                      (unless (nonblank (sobject-id object))
-                        (setf (sobject-id object) sf-id))
-                      object)
-                     (t (make-instance 'sobject :id sf-id :type sf-type)))))
-       ;; Failed rows: (object-or-nil . error-string).  sf__Id is blank when
-       ;; the record never got an Id (a failed insert, or a nonexistent Id);
-       ;; the row still echoes the Id we sent, in the original Id column.
-       :failed
-       (loop with names = (car failure)
-             for row in (cdr failure)
-             for sf-id = (or (nonblank (cell row names "sf__Id")) (nonblank (cell row names "Id")))
-             collect (cons (or (and id->obj sf-id (gethash sf-id id->obj))
-                               (by-content row names))
-                           (or (cell row names "sf__Error") "Unknown error")))
-       ;; Unprocessed: fresh generic sobjects
-       :unprocessed
-       (loop for row in unproc-rows
-             collect (make-instance 'sobject :id (svref row 0) :type sf-type))
-       :job-id job-id))))
+             (nonblank (id) (and id (plusp (length id)) id))
+             (success-by-id (row names)
+               (let ((sf-id (cell row names "sf__Id"))
+                     (created (cell row names "sf__Created")))
+                 (and id->obj sf-id (not (and (eq operation :upsert) (equal created "true")))
+                      (gethash sf-id id->obj))))
+             (failure-by-id (row names)
+               ;; sf__Id is blank when the record never got an Id (a failed insert, or
+               ;; a nonexistent Id); the row still echoes the Id we sent, in "Id"
+               (let ((sf-id (or (nonblank (cell row names "sf__Id")) (nonblank (cell row names "Id")))))
+                 (and id->obj sf-id (gethash sf-id id->obj))))
+             (cells-of (row names) (mapcar (lambda (column) (cell row names column)) columns)))
+      (let* ((s-names (car success)) (s-rows (cdr success))
+             (f-names (car failure)) (f-rows (cdr failure))
+             (s-objs  (mapcar (lambda (row) (success-by-id row s-names)) s-rows))
+             (f-objs  (mapcar (lambda (row) (failure-by-id row f-names)) f-rows))
+             ;; the rows no Id accounted for, successes first
+             (pending (when content-p
+                        (append (loop for row in s-rows for o in s-objs unless o collect (cells-of row s-names))
+                                (loop for row in f-rows for o in f-objs unless o collect (cells-of row f-names)))))
+             ;; the records already exist in Salesforce: if matching them up goes
+             ;; wrong for any reason, report fresh objects rather than lose the result
+             (found   (if pending
+                          (handler-case
+                              (values (%match-by-content inputs upload columns pending
+                                                         (and (eq operation :insert)
+                                                              (= (+ (length s-rows) (length f-rows))
+                                                                 (length inputs)))))
+                            (error (e)
+                              (warn "cl-sf: could not match the bulk results to the objects sent (~A); ~
+                                     returning new objects carrying the Ids" e)
+                              (make-array (length pending) :initial-element nil)))
+                          #()))
+             (cursor  0))
+        (flet ((next-found () (prog1 (svref found cursor) (incf cursor))))
+          (make-bulk-result
+           :successful
+           (loop for row in s-rows
+                 for owner in s-objs
+                 for sf-id = (cell row s-names "sf__Id")
+                 collect (let ((object (or owner (and content-p (next-found)))))
+                           (cond (object
+                                  ;; an inserted (or upsert-created) object learns its Id
+                                  (unless (nonblank (sobject-id object))
+                                    (setf (sobject-id object) sf-id))
+                                  object)
+                                 (t (make-instance 'sobject :id sf-id :type sf-type)))))
+           :failed
+           (loop for row in f-rows
+                 for owner in f-objs
+                 collect (cons (or owner (and content-p (next-found)))
+                               (or (cell row f-names "sf__Error") "Unknown error")))
+           ;; Unprocessed: fresh generic sobjects
+           :unprocessed
+           (loop for row in unproc-rows
+                 collect (make-instance 'sobject :id (svref row 0) :type sf-type))
+           :job-id job-id))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; High-level CLOS-first operations

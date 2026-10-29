@@ -751,20 +751,95 @@ y") ("z" "w"))
               "every result is one of ours, none a stand-in")
         (is = (length labels) (length (remove nil (mapcar #'cl-sf/objects:sobject-id objects))))))))
 
-(define-test insert-matching/a-row-that-does-not-match-falls-back-to-a-fresh-object
+(define-test insert-matching/rows-that-do-not-match-fall-back-to-fresh-objects
   :parent insert-matching
-  (let* ((sent (make-widget :label "sent" :amount 1))
+  (let* ((one (make-widget :label "sent one" :amount 1))
+         (two (make-widget :label "sent two" :amount 2))
          (columns '("Label__c" "Amount__c")))
     (with-stubbed-results
-        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c") '("001Z" "true" "CHANGED" "1"))
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                              '("001Y" "true" "CHANGED-2" "2") '("001Z" "true" "CHANGED-1" "1"))
          :failed "" :unprocessed "")
-      (let* ((result (cl-sf/bulk::%build-bulk-result nil "J" (list sent) :insert "Widget"
-                                                     :upload (upload-of (list sent) columns) :columns columns))
-             (stand-in (first (cl-sf/bulk:bulk-result-successful result))))
-        (false (eq stand-in sent))
-        (is string= "001Z" (cl-sf/objects:sobject-id stand-in))
-        (is string= "Widget" (cl-sf/objects:sobject-type stand-in))
-        (false (cl-sf/objects:sobject-id sent))))))
+      (let* ((result (cl-sf/bulk::%build-bulk-result nil "J" (list one two) :insert "Widget"
+                                                     :upload (upload-of (list one two) columns) :columns columns))
+             (stand-ins (cl-sf/bulk:bulk-result-successful result)))
+        (is = 2 (length stand-ins))
+        (true (notany (lambda (o) (member o (list one two) :test #'eq)) stand-ins))
+        (is equal '("001Y" "001Z") (mapcar #'cl-sf/objects:sobject-id stand-ins))
+        (is string= "Widget" (cl-sf/objects:sobject-type (first stand-ins)))
+        (false (cl-sf/objects:sobject-id one))
+        (false (cl-sf/objects:sobject-id two))))))
+
+(define-test insert-matching/numbers-salesforce-rewrites-still-match
+  :parent insert-matching
+  ;; observed live: Amount sent as 1.50 is echoed as 1.5
+  (let* ((a (make-widget :label "a" :amount "1.50"))
+         (b (make-widget :label "b" :amount 1000.0d0))
+         (c (make-widget :label "c" :amount "+7.0"))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                              '("001A" "true" "a" "1.5") '("001B" "true" "b" "1000") '("001C" "true" "c" "7"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a b c) :insert "Widget"
+                                                    :upload (upload-of (list a b c) columns) :columns columns)))
+        (is equal '("001A" "001B" "001C") (mapcar #'cl-sf/objects:sobject-id (list a b c)))
+        (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list a b c)))))))
+
+(define-test insert-matching/one-leftover-pair-is-matched-by-elimination
+  :parent insert-matching
+  ;; the other rows match exactly; the last differs in a way we don't know about
+  (let* ((a (make-widget :label "a" :amount 1))
+         (b (make-widget :label "b" :amount 2))
+         (odd (make-widget :label "odd" :amount 3))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                              '("001A" "true" "a" "1") '("001B" "true" "b" "2") '("001O" "true" "ODD, rewritten" "3"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a b odd) :insert "Widget"
+                                                    :upload (upload-of (list a b odd) columns) :columns columns)))
+        (is string= "001O" (cl-sf/objects:sobject-id odd))
+        (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list a b odd)))))))
+
+(define-test insert-matching/elimination-needs-every-input-to-have-a-result-row
+  :parent insert-matching
+  ;; 3 inputs but only 2 result rows (one unaccounted for): one leftover pair would be a guess
+  (let* ((a (make-widget :label "a" :amount 1))
+         (b (make-widget :label "b" :amount 2))
+         (c (make-widget :label "c" :amount 3))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                              '("001A" "true" "a" "1") '("001X" "true" "REWRITTEN" "2"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a b c) :insert "Widget"
+                                                    :upload (upload-of (list a b c) columns) :columns columns)))
+        (is string= "001A" (cl-sf/objects:sobject-id a))
+        (false (cl-sf/objects:sobject-id b))
+        (false (cl-sf/objects:sobject-id c))
+        (is = 2 (length (cl-sf/bulk:bulk-result-successful result)))))))
+
+(define-test canonical-number/normalises-plain-decimals-only
+  :parent insert-matching
+  (flet ((canon (s) (cl-sf/bulk::%canonical-number s)))
+    (is string= "1.5" (canon "1.50"))
+    (is string= "1.5" (canon "+1.5"))
+    (is string= "1.5" (canon "001.500"))
+    (is string= "1000" (canon "1000.0"))
+    (is string= "0" (canon "0.000"))
+    (is string= "0" (canon "-0.0"))
+    (is string= "-2.5" (canon "-2.50"))
+    (is string= "7" (canon "7"))
+    ;; not plain decimals: untouched
+    (is string= "" (canon ""))
+    (is string= "abc" (canon "abc"))
+    (is string= "1e5" (canon "1e5"))
+    (is string= "1.2.3" (canon "1.2.3"))
+    (is string= "-" (canon "-"))
+    (is string= "." (canon "."))
+    (is string= "12:30" (canon "12:30"))
+    (is string= "2030-05-01" (canon "2030-05-01"))))
 
 (define-test insert-matching/without-the-upload-it-is-the-old-behaviour
   :parent insert-matching
@@ -801,3 +876,21 @@ y") ("z" "w"))
       (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a) :delete "Account"
                                                     :upload (upload-of (list a) columns) :columns columns)))
         (is eq a (first (cl-sf/bulk:bulk-result-successful result)))))))
+
+(define-test insert-matching/a-matching-error-still-returns-the-ids
+  :parent insert-matching
+  (let* ((sent (make-widget :label "sent" :amount 1))
+         (columns '("Label__c" "Amount__c"))
+         (warned nil))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c") '("001K" "true" "sent" "1"))
+         :failed "" :unprocessed "")
+      (with-fdefinitions ((cl-sf/bulk::%match-by-content
+                           (lambda (&rest args) (declare (ignore args)) (error "boom"))))
+        (handler-bind ((warning (lambda (w) (setf warned t) (muffle-warning w))))
+          (let* ((result (cl-sf/bulk::%build-bulk-result nil "J" (list sent) :insert "Widget"
+                                                         :upload (upload-of (list sent) columns) :columns columns))
+                 (fresh (first (cl-sf/bulk:bulk-result-successful result))))
+            (true warned "the failure is reported")
+            (is string= "001K" (cl-sf/objects:sobject-id fresh) "...but the new Id is not lost")
+            (false (eq fresh sent))))))))
