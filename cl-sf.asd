@@ -23,6 +23,8 @@
                (:file "api")
                ;; TODO #5 — CLOS sObject definitions + public API wrappers
                (:file "objects")
+               ;; GraphQL front end (uses the describe/class machinery above)
+               (:file "graphql")
                ;; TODO #4 — Bulk 2.0 API support
                (:file "bulk")
                ;; Top-level package re-exporting the public API surface
@@ -39,6 +41,7 @@
                (:file "auth-tests")
                (:file "api-tests")
                (:file "bulk-tests")
-               (:file "objects-tests"))
+               (:file "objects-tests")
+               (:file "graphql-tests"))
   :perform (test-op (op c)
              (uiop:symbol-call '#:parachute '#:test '#:cl-sf/tests)))

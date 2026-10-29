@@ -123,6 +123,7 @@
    ;; SOQL
    #:soql
    #:select
+   #:gql
    ;; sObject CRUD (accept/return SOBJECT instances)
    #:sobject-get
    #:database-insert

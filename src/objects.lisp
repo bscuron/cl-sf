@@ -170,8 +170,9 @@
                      collect (list (intern (string-upcase sf-name)) sf-name))))
     class-sym))
 
-(defun %register-sobject-class (conn name)
-  "DESCRIBE-SOBJECT NAME via CONN and register a CLOS class for it in
+(defun %register-sobject-class (conn name &optional desc)
+  "DESCRIBE-SOBJECT NAME via CONN (unless DESC, that describe result, is
+   already in hand) and register a CLOS class for it in
    *SOBJECT-CLASSES*.  Returns the class, or NIL if DESCRIBE-SOBJECT fails
    (caching the failure as :FAILED so repeated records of an undescribable
    type — no permission, doesn't exist — don't each retry the API call)."
@@ -181,7 +182,8 @@
       (when existing
         (return-from %register-sobject-class (unless (eq existing :failed) existing))))
     (handler-case
-        (find-class (%eval-define-sobject-class name (describe-sobject name :conn conn)))
+        (find-class (%eval-define-sobject-class
+                     name (or desc (describe-sobject name :conn conn))))
       (error (e)
         (warn "cl-sf: lazy describe-sobject failed for ~A: ~A" name e)
         (setf (gethash name *sobject-classes*) :failed)
