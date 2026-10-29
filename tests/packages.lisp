@@ -27,10 +27,15 @@
           do (setf (gethash k h) v))
     h))
 
+(defun csv-text (octets)
+  "UTF-8 OCTETS as a string."
+  (sb-ext:octets-to-string octets :external-format :utf-8))
+
 (defun csv-field (value)
-  "Render VALUE as a CSV field string (via %write-csv-field)."
-  (with-output-to-string (s)
-    (cl-sf/bulk::%write-csv-field value s)))
+  "Render VALUE as one CSV cell, as a string (via %write-field)."
+  (let ((buf (cl-sf/bulk::%make-obuf 4)))
+    (cl-sf/bulk::%write-field buf value)
+    (csv-text (cl-sf/bulk::%obuf-octets buf))))
 
 (defun mock-query-response (&key (total 0) (done t) records next-url)
   "Build a jzon-style hash-table mimicking a Salesforce /query response."

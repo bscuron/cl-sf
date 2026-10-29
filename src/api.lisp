@@ -113,7 +113,8 @@
    CONN         — a CL-SF/AUTH:CONNECTION; defaults to *CONNECTION* (see WITH-CONN)
    METHOD       — :GET :POST :PATCH :DELETE or :PUT
    PATH         — relative path (e.g. \"sobjects/Account\") or absolute URL
-   BODY         — optional body to send.  If a string, sent as-is (e.g. CSV).
+   BODY         — optional body to send.  A string or octet vector is sent
+                  as-is (e.g. CSV).
                   Any other Lisp object is serialized with jzon:stringify.
    PARAMS       — optional alist of (string . value) query parameters
    CONTENT-TYPE — HTTP Content-Type header for the body (default \"application/json\").
@@ -139,7 +140,8 @@
            (let* ((url     (%build-url conn path params))
                   ;; String bodies (CSV) pass through; everything else → JSON
                   (content (when body
-                             (if (stringp body)
+                             (if (or (stringp body)
+                                     (typep body '(simple-array (unsigned-byte 8) (*))))
                                  body
                                  (com.inuoe.jzon:stringify body))))
                   (headers (if content

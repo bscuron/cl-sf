@@ -1,7 +1,5 @@
 ;;;; cl-sf/tests/bulk-tests.lisp
-;;;; Unit tests for cl-sf/bulk — pure CSV and struct functions, no HTTP/lparallel.
-;;;; All %sobjects->csv tests use n <= *bulk-csv-chunk-size* to stay in the
-;;;; sequential path and avoid needing a lparallel kernel.
+;;;; Unit tests for cl-sf/bulk — CSV writing/parsing, result correlation (HTTP stubbed).
 
 (in-package #:cl-sf/tests)
 
@@ -18,37 +16,7 @@
   :description "Bulk 2.0 — CSV generation, parsing, column selection, result struct.")
 
 ;;; ──────────────────────────────────────────────────────────────────
-;;; %csv-needs-quoting-p
-;;; ──────────────────────────────────────────────────────────────────
-
-(define-test csv-quoting/plain-string
-  :parent bulk
-  (false (cl-sf/bulk::%csv-needs-quoting-p "HelloWorld") "plain string → no quoting"))
-
-(define-test csv-quoting/empty-string
-  :parent bulk
-  (false (cl-sf/bulk::%csv-needs-quoting-p "") "empty string → no quoting"))
-
-(define-test csv-quoting/contains-comma
-  :parent bulk
-  (true (cl-sf/bulk::%csv-needs-quoting-p "hello,world") "comma → needs quoting"))
-
-(define-test csv-quoting/contains-double-quote
-  :parent bulk
-  (true (cl-sf/bulk::%csv-needs-quoting-p "say \"hi\"") "double-quote → needs quoting"))
-
-(define-test csv-quoting/contains-newline
-  :parent bulk
-  (true (cl-sf/bulk::%csv-needs-quoting-p "line1
-line2") "newline → needs quoting"))
-
-(define-test csv-quoting/contains-carriage-return
-  :parent bulk
-  (true (cl-sf/bulk::%csv-needs-quoting-p (coerce '(#\a #\return #\b) 'string))
-        "carriage return → needs quoting"))
-
-;;; ──────────────────────────────────────────────────────────────────
-;;; %write-csv-field (via csv-field helper)
+;;; %write-field (via csv-field helper)
 ;;; ──────────────────────────────────────────────────────────────────
 
 (define-test write-csv-field/plain-string
@@ -161,7 +129,7 @@ y") ("z" "w"))
          (csv    (cl-sf/bulk::%sobjects->csv objs '("Label__c" "Amount__c"))))
     (is equal labels
         (map 'list (lambda (row) (svref row 0))
-             (cl-sf/bulk::%csv-select (octets csv) '("Label__c"))))))
+             (cl-sf/bulk::%csv-select csv '("Label__c"))))))
 
 (define-test csv-select/large-file
   :parent bulk
@@ -274,7 +242,7 @@ y") ("z" "w"))
   :parent bulk
   (let* ((objs  (list (make-widget :label "Foo" :amount 100)))
          (cols  '("Label__c" "Amount__c"))
-         (csv   (cl-sf/bulk::%sobjects->csv objs cols)))
+         (csv   (csv-text (cl-sf/bulk::%sobjects->csv objs cols))))
     (is string= "Label__c,Amount__c" (first (cl-ppcre:split "\\n" csv))
         "First line is the header")))
 
@@ -282,7 +250,7 @@ y") ("z" "w"))
   :parent bulk
   (let* ((objs (list (make-widget :label "Acme" :amount 999)))
          (cols '("Label__c" "Amount__c"))
-         (csv  (cl-sf/bulk::%sobjects->csv objs cols))
+         (csv  (csv-text (cl-sf/bulk::%sobjects->csv objs cols)))
          (lines (remove "" (cl-ppcre:split "\\n" csv) :test #'equal)))
     (is = 2 (length lines) "One header + one data row")
     (is string= "Acme,999" (second lines))))
@@ -291,7 +259,7 @@ y") ("z" "w"))
   :parent bulk
   (let* ((objs  (list (make-widget :label "Test" :amount nil)))
          (cols  '("Label__c" "Amount__c"))
-         (csv   (cl-sf/bulk::%sobjects->csv objs cols))
+         (csv   (csv-text (cl-sf/bulk::%sobjects->csv objs cols)))
          (lines (remove "" (cl-ppcre:split "\\n" csv) :test #'equal)))
     (is string= "Test," (second lines)
         "nil amount → empty column in CSV")))
@@ -300,7 +268,7 @@ y") ("z" "w"))
   :parent bulk
   (let* ((objs  (list (make-widget :label "Hello, World")))
          (cols  '("Label__c"))
-         (csv   (cl-sf/bulk::%sobjects->csv objs cols))
+         (csv   (csv-text (cl-sf/bulk::%sobjects->csv objs cols)))
          (lines (remove "" (cl-ppcre:split "\\n" csv) :test #'equal)))
     (is string= "\"Hello, World\"" (second lines)
         "Value with comma is quoted")))
@@ -309,7 +277,7 @@ y") ("z" "w"))
   :parent bulk
   (let* ((objs  (list (make-widget :label "A") (make-widget :label "B") (make-widget :label "C")))
          (cols  '("Label__c"))
-         (csv   (cl-sf/bulk::%sobjects->csv objs cols))
+         (csv   (csv-text (cl-sf/bulk::%sobjects->csv objs cols)))
          (lines (remove "" (cl-ppcre:split "\\n" csv) :test #'equal)))
     (is = 4 (length lines) "Header + 3 data rows")))
 
@@ -321,7 +289,7 @@ y") ("z" "w"))
   ;; feeding bulk-insert's results straight into bulk-delete is normal.
   (let* ((objs  (list (make-instance 'cl-sf/objects:sobject :id "001xxBULKTEST" :type "Account")))
          (cols  '("Id"))
-         (csv   (cl-sf/bulk::%sobjects->csv objs cols))
+         (csv   (csv-text (cl-sf/bulk::%sobjects->csv objs cols)))
          (lines (remove "" (cl-ppcre:split "\\n" csv) :test #'equal)))
     (is string= "001xxBULKTEST" (second lines)
         "Id column is populated from SOBJECT-ID, not left blank")))
@@ -377,3 +345,100 @@ y") ("z" "w"))
       (cl-sf/bulk:bulk-job-failed-error (e)
         (is string= "JOB2" (cl-sf/bulk:bulk-job-failed-error-job-id e))
         (is equal status   (cl-sf/bulk:bulk-job-failed-error-status e))))))
+
+;;; ──────────────────────────────────────────────────────────────────
+;;; CSV writer — UTF-8 octets, column plan, chunked parallel path
+;;; ──────────────────────────────────────────────────────────────────
+
+(define-test write-field/integers-without-consing-paths
+  :parent bulk
+  (is string= "0" (csv-field 0))
+  (is string= "9" (csv-field 9))
+  (is string= "10" (csv-field 10))
+  (is string= "1234567890" (csv-field 1234567890))
+  (is string= (princ-to-string most-positive-fixnum) (csv-field most-positive-fixnum))
+  (is string= "-5" (csv-field -5))
+  (is string= (princ-to-string (expt 10 30)) (csv-field (expt 10 30))))
+
+(define-test write-field/floats-booleans-and-symbols
+  :parent bulk
+  (is string= "1.5" (csv-field 1.5d0))
+  (is string= "0.1" (csv-field 0.1))
+  (is string= "true" (csv-field t))
+  (is string= "" (csv-field nil))
+  (is string= "FOO" (csv-field :foo))
+  (is string= "1/3" (csv-field 1/3)))
+
+(define-test write-field/non-ascii-is-utf-8
+  :parent bulk
+  (flet ((bytes (value)
+           (let ((buf (cl-sf/bulk::%make-obuf 4)))
+             (cl-sf/bulk::%write-field buf value)
+             (coerce (cl-sf/bulk::%obuf-octets buf) 'list))))
+    (is equal '(#x63 #x61 #x66 #xC3 #xA9) (bytes "café"))            ; 2-byte
+    (is equal '(#xE2 #x98 #x83) (bytes (string (code-char #x2603))))        ; 3-byte
+    (is equal '(#xF0 #x9F #x98 #x80) (bytes (string (code-char #x1F600))))  ; 4-byte
+    ;; quoted, with a doubled quote, and a multi-byte char after it
+    (is equal '(34 97 34 34 #xC3 #xA9 34) (bytes (format nil "a\"é")))))
+
+(define-test write-field/buffer-grows-across-many-fields
+  :parent bulk
+  ;; each cell is "x,y" quoted (5 bytes) plus a newline, 1000 times
+  (let ((buf (cl-sf/bulk::%make-obuf 1)))
+    (dotimes (i 1000)
+      (cl-sf/bulk::%write-field buf "x,y")
+      (cl-sf/bulk::%obuf-byte buf 10))
+    (is = 6000 (length (cl-sf/bulk::%obuf-octets buf)))))
+
+(define-test sobjects->csv/returns-exact-size-octets
+  :parent bulk
+  (let ((csv (cl-sf/bulk::%sobjects->csv (list (make-widget :label "Acme" :amount 5)) '("Label__c" "Amount__c"))))
+    (true (typep csv '(simple-array (unsigned-byte 8) (*))))
+    (is string= (format nil "Label__c,Amount__c~%Acme,5~%") (csv-text csv))))
+
+(define-test sobjects->csv/empty-list-is-just-the-header
+  :parent bulk
+  (is string= (format nil "Id~%") (csv-text (cl-sf/bulk::%sobjects->csv '() '("Id")))))
+
+(define-test sobjects->csv/parallel-chunks-match-the-sequential-output
+  :parent bulk
+  (let* ((objs (loop for i below 53
+                     collect (make-widget :label (format nil "n~D, \"q\" café ~D" i i) :amount i)))
+         (cols '("Label__c" "Amount__c"))
+         (sequential (let ((cl-sf/bulk:*bulk-csv-chunk-size* 100000))
+                       (cl-sf/bulk::%sobjects->csv objs cols)))
+         (parallel   (let ((cl-sf/bulk:*bulk-csv-chunk-size* 7))
+                       (cl-sf/bulk::%sobjects->csv objs cols))))
+    (is = 54 (count 10 sequential))
+    (is equalp sequential parallel)))
+
+(define-test sobjects->csv/id-slot-and-raw-columns
+  :parent bulk
+  (let* ((typed   (make-widget :label "T"))
+         (raw     (make-hash-table :test #'equal))
+         (generic (make-instance 'cl-sf/objects:sobject :id "001G" :type "X" :raw raw)))
+    (setf (cl-sf/objects:sobject-id typed) "001T"
+          (gethash "Custom__c" raw) "from raw"
+          (gethash "Id" raw) "ignored: Id comes from the accessor")
+    ;; typed object: Id accessor, typed slot, and a field the slot map lacks (-> raw)
+    (is string= (format nil "Id,Label__c,Missing__c~%001T,T,~%")
+        (csv-text (cl-sf/bulk::%sobjects->csv (list typed) '("Id" "Label__c" "Missing__c"))))
+    ;; generic object: everything from raw, Id still from the accessor
+    (is string= (format nil "Id,Custom__c~%001G,from raw~%")
+        (csv-text (cl-sf/bulk::%sobjects->csv (list generic) '("Id" "Custom__c"))))))
+
+(define-test sobjects->csv/records-of-another-class-take-the-generic-path
+  :parent bulk
+  ;; the plan is built from the FIRST record; a record of a different class
+  ;; must not be read through that class's slot indexes
+  (let* ((widget (make-widget :label "W" :amount 1))
+         (other  (make-instance 'test-contact :last-name "Lopez")))
+    (is string= (format nil "Label__c~%W~%~%")
+        (csv-text (cl-sf/bulk::%sobjects->csv (list widget other) '("Label__c"))))))
+
+(define-test sobjects->csv/unbound-slot-is-an-empty-cell
+  :parent bulk
+  (let ((w (make-widget :label "L")))
+    (slot-makunbound w 'cl-sf/tests::label)
+    (is string= (format nil "Label__c~%~%")
+        (csv-text (cl-sf/bulk::%sobjects->csv (list w) '("Label__c"))))))

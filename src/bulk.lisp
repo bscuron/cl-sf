@@ -85,87 +85,205 @@
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; CSV generation — performance-critical
+;;;
+;;; Rows are written straight into a growable UTF-8 octet buffer (the form
+;;; the HTTP body needs anyway: a Lisp string is 4 bytes per character and
+;;; would be encoded again on send).  Each column's accessor is resolved
+;;; once per job, not once per field; integers are written without
+;;; consing; a field is quoted only if it contains , " CR or LF.
 ;;; ──────────────────────────────────────────────────────────────────
 
-(declaim (ftype (function (string) boolean) %csv-needs-quoting-p)
-         (inline %csv-needs-quoting-p))
-(defun %csv-needs-quoting-p (s)
-  "Return T if string S contains any CSV special character.
-   Inlined; tight loop for minimal per-field overhead."
-  (declare (type simple-string s)
-           (optimize (speed 3) (safety 1) (debug 0)))
-  (dotimes (i (length s) nil)
-    (let ((c (schar s i)))
-      (when (or (char= c #\,) (char= c #\") (char= c #\newline) (char= c #\return))
-        (return t)))))
+(deftype octets () '(simple-array (unsigned-byte 8) (*)))
 
-(defun %write-csv-field (value stream)
-  "Write VALUE as a single CSV field to STREAM.
-   Allocates only for fields that require quoting (rare in practice)."
-  (declare (optimize (speed 3) (safety 1)))
-  (let ((s (etypecase value
-             (null     "")
-             (string   value)
-             (integer  (write-to-string value))
-             (float    (write-to-string value))
-             (double-float (write-to-string value))
-             (symbol   (symbol-name value))
-             (t        (princ-to-string value)))))
-    (declare (type simple-string s))
-    (if (%csv-needs-quoting-p s)
-        ;; Quoted: wrap in double-quotes, escape internal double-quotes as ""
-        (progn
-          (write-char #\" stream)
-          (dotimes (i (length s))
-            (let ((c (schar s i)))
-              (when (char= c #\") (write-char #\" stream))
-              (write-char c stream)))
-          (write-char #\" stream))
-        ;; Unquoted: write directly, zero allocation
-        (write-string s stream))))
+(defstruct (obuf (:constructor %make-obuf
+                     (&optional (capacity 4096)
+                      &aux (bytes (make-array capacity :element-type '(unsigned-byte 8))))))
+  "A growable UTF-8 output buffer: bytes [0, FILL) are valid."
+  (bytes (make-array 0 :element-type '(unsigned-byte 8)) :type octets)
+  (fill 0 :type fixnum))
 
-(defun %sobject-field-value (obj sf-field-name slot-map)
-  "Return the value of SF-FIELD-NAME in OBJ.
-   Id is checked first via the dedicated SOBJECT-ID accessor — Id is
-   always excluded from generated slot-maps (it's read-only) and a
-   bulk-result object may have neither a slot-map entry nor a populated
-   SF-RAW (e.g. a fresh insert result, (make-instance 'sobject :id ...)
-   with no :raw) — so Id must never depend on either of those.  This
-   matters for round-tripping bulk-insert's own results straight into a
-   later bulk-update/delete/upsert call, which is a normal thing to do.
-   Otherwise looks up via SLOT-MAP first (O(1) with small alists), falls
-   back to SF-RAW."
-  (declare (optimize (speed 3) (safety 1)))
-  (cond
-    ((equal sf-field-name "Id") (sobject-id obj))
-    (slot-map
-     (let ((pair (assoc sf-field-name slot-map :test #'equal)))
-       (if pair
-           (let ((slot (cdr pair)))
-             (if (slot-boundp obj slot) (slot-value obj slot) nil))
-           ;; Field not in slot map — check raw data
-           (let ((raw (sobject-raw obj)))
-             (when raw (gethash sf-field-name raw))))))
-    (t
-     ;; Generic sobject: all data lives in sf-raw
-     (let ((raw (sobject-raw obj)))
-       (when raw (gethash sf-field-name raw))))))
+(declaim (inline %obuf-reserve %obuf-byte))
+(defun %obuf-reserve (buf n)
+  "Make room for N more bytes."
+  (declare (type obuf buf) (type fixnum n) (optimize (speed 3) (safety 0)))
+  (let ((need (+ (obuf-fill buf) n))
+        (bytes (obuf-bytes buf)))
+    (declare (type fixnum need))
+    (when (> need (length bytes))
+      (let ((new (make-array (max need (* 2 (length bytes))) :element-type '(unsigned-byte 8))))
+        (replace new bytes :end2 (obuf-fill buf))
+        (setf (obuf-bytes buf) new)))))
 
-(defun %write-csv-header (fields stream)
-  "Write the CSV header row to STREAM."
+(defun %obuf-byte (buf b)
+  (declare (type obuf buf) (type (unsigned-byte 8) b) (optimize (speed 3) (safety 0)))
+  (%obuf-reserve buf 1)
+  (setf (aref (obuf-bytes buf) (obuf-fill buf)) b)
+  (incf (obuf-fill buf)))
+
+(defun %obuf-octets (buf)
+  "A fresh exact-size octet vector holding BUF's contents."
+  (subseq (obuf-bytes buf) 0 (obuf-fill buf)))
+
+(defmacro %with-simple-string ((var string) &body body)
+  "Run BODY with VAR bound to STRING (a SIMPLE-STRING) declared as its
+   concrete type, so SCHAR compiles to a direct access."
+  `(let ((,var ,string))
+     (etypecase ,var
+       ((simple-array character (*))
+        (locally (declare (type (simple-array character (*)) ,var)) ,@body))
+       (simple-base-string
+        (locally (declare (type simple-base-string ,var)) ,@body)))))
+
+(defun %obuf-write-text (buf s)
+  "Write the string S as one CSV field in UTF-8: double-quoted, with inner
+   quotes doubled, only if it contains a comma, quote, CR or LF."
+  (declare (type obuf buf) (type simple-string s) (optimize (speed 3) (safety 0)))
+  (%with-simple-string (s s)
+    (let ((len (length s)) (quote-p nil) (wide nil))
+      (declare (type fixnum len))
+      (dotimes (i len)
+        (let ((c (char-code (schar s i))))
+          (cond ((or (= c 44) (= c 34) (= c 10) (= c 13)) (setf quote-p t))
+                ((>= c 128) (setf wide t)))))
+      ;; worst case per character: 4 bytes (a doubled quote is only 2)
+      (%obuf-reserve buf (+ (* len (if wide 4 2)) 2))
+      (let ((bytes (obuf-bytes buf)) (pos (obuf-fill buf)))
+        (declare (type octets bytes) (type fixnum pos))
+        (when quote-p
+          (setf (aref bytes pos) 34) (incf pos))
+        (dotimes (i len)
+          (let ((c (char-code (schar s i))))
+            (cond ((< c #x80)
+                   (when (and quote-p (= c 34))
+                     (setf (aref bytes pos) 34) (incf pos))
+                   (setf (aref bytes pos) c) (incf pos))
+                  ((< c #x800)
+                   (setf (aref bytes pos)       (logior #xC0 (ash c -6))
+                         (aref bytes (+ pos 1)) (logior #x80 (logand c #x3F)))
+                   (incf pos 2))
+                  ((< c #x10000)
+                   (setf (aref bytes pos)       (logior #xE0 (ash c -12))
+                         (aref bytes (+ pos 1)) (logior #x80 (logand (ash c -6) #x3F))
+                         (aref bytes (+ pos 2)) (logior #x80 (logand c #x3F)))
+                   (incf pos 3))
+                  (t
+                   (setf (aref bytes pos)       (logior #xF0 (ash c -18))
+                         (aref bytes (+ pos 1)) (logior #x80 (logand (ash c -12) #x3F))
+                         (aref bytes (+ pos 2)) (logior #x80 (logand (ash c -6) #x3F))
+                         (aref bytes (+ pos 3)) (logior #x80 (logand c #x3F)))
+                   (incf pos 4)))))
+        (when quote-p
+          (setf (aref bytes pos) 34) (incf pos))
+        (setf (obuf-fill buf) pos)))))
+
+(defun %obuf-write-integer (buf n)
+  "Write the non-negative fixnum N in decimal, without consing."
+  (declare (type obuf buf) (type (and fixnum unsigned-byte) n) (optimize (speed 3) (safety 0)))
+  (%obuf-reserve buf 20)
+  (let ((bytes (obuf-bytes buf)) (pos (obuf-fill buf)))
+    (declare (type octets bytes) (type fixnum pos))
+    (if (< n 10)
+        (progn (setf (aref bytes pos) (+ 48 n)) (incf pos))
+        (let ((digits 0) (m n))
+          (declare (type fixnum digits m))
+          (loop while (> m 0) do (setf m (floor m 10)) (incf digits))
+          (let ((end (+ pos digits)) (p (+ pos digits)))
+            (declare (type fixnum end p))
+            (loop while (> n 0)
+                  do (multiple-value-bind (q r) (floor n 10)
+                       (decf p)
+                       (setf (aref bytes p) (+ 48 r) n q)))
+            (setf pos end))))
+    (setf (obuf-fill buf) pos)))
+
+(defun %field-text (value)
+  "VALUE (anything but NIL, a string or a small non-negative integer) as
+   the text Salesforce expects in a CSV cell."
+  (typecase value
+    (double-float (let ((*read-default-float-format* 'double-float)) (prin1-to-string value)))
+    (single-float (let ((*read-default-float-format* 'single-float)) (prin1-to-string value)))
+    ((eql t)      "true")
+    (symbol       (symbol-name value))
+    (local-time:timestamp (local-time:format-timestring nil value))
+    (t            (princ-to-string value))))
+
+(defun %write-field (buf value)
+  "Write VALUE as one CSV cell (NIL is an empty cell)."
+  (declare (type obuf buf))
+  (typecase value
+    (null nil)
+    (simple-string (%obuf-write-text buf value))
+    (string        (%obuf-write-text buf (coerce value 'simple-string)))
+    ((and fixnum unsigned-byte) (%obuf-write-integer buf value))
+    (t             (%obuf-write-text buf (coerce (%field-text value) 'simple-string)))))
+
+;;; — Column plan: resolve each field's accessor once per job —
+
+(defun %slot-location (class slot-name)
+  "The instance-storage index of SLOT-NAME in CLASS, or NIL (class slots,
+   unknown slot)."
+  (let ((def (find slot-name (sb-mop:class-slots class) :key #'sb-mop:slot-definition-name)))
+    (and def
+         (let ((loc (sb-mop:slot-definition-location def)))
+           (and (integerp loc) loc)))))
+
+(defun %csv-column-plan (record fields)
+  "Return (values class plan): for each of FIELDS (Salesforce API names), how
+   to read it from RECORD-shaped objects — the dedicated Id accessor (always
+   works, including generic result objects with no raw data), a typed slot
+   (by storage index when RECORD's class allows it), or SOBJECT-RAW.  The
+   slot map is taken from RECORD's class, as every record in a job is the
+   same type."
+  (let* ((class    (class-of record))
+         (slot-map (gethash (class-name class) *sobject-slot-maps*)))
+    (values class
+            (map 'simple-vector
+                 (lambda (field)
+                   (let ((pair (and slot-map (assoc field slot-map :test #'equal))))
+                     (cond ((equal field "Id") (list :id))
+                           (pair (let ((loc (%slot-location class (cdr pair))))
+                                   (if loc
+                                       (list :slot loc (cdr pair) field)
+                                       (list :slot-name (cdr pair) field))))
+                           (t (list :raw field)))))
+                 fields))))
+
+(declaim (inline %column-value))
+(defun %column-value (entry obj class)
+  "OBJ's value for a plan ENTRY.  The by-index slot read is only valid for
+   instances of exactly CLASS; any other object (e.g. a generic SOBJECT of
+   the same sObject type) uses the slot if it has one, else its raw data."
+  (declare (type cons entry) (optimize (speed 3) (safety 0)))
+  (labels ((raw (field)
+             (let ((raw (sobject-raw obj)))
+               (and raw (gethash field raw))))
+           (slot (name field)
+             (cond ((not (slot-exists-p obj name)) (raw field))
+                   ((slot-boundp obj name) (slot-value obj name))
+                   (t nil))))
+    (case (car entry)
+      (:id (sobject-id obj))
+      (:slot (if (eq (class-of obj) class)
+                 (let ((v (sb-mop:standard-instance-access obj (the fixnum (cadr entry)))))
+                   (if (eq v sb-pcl::+slot-unbound+) nil v))
+                 (slot (caddr entry) (cadddr entry))))
+      (:slot-name (slot (cadr entry) (caddr entry)))
+      (t (raw (cadr entry))))))
+
+(defun %write-csv-header (buf fields)
   (loop for field in fields
-        for i from 0
-        when (> i 0) do (write-char #\, stream)
-        do (write-string field stream))
-  (write-char #\newline stream))
+        for first = t then nil
+        do (unless first (%obuf-byte buf 44))
+           (%obuf-write-text buf (coerce field 'simple-string)))
+  (%obuf-byte buf 10))
 
-(defun %write-csv-row (obj fields slot-map stream)
-  "Write one SOBJECT as a CSV row to STREAM."
-  (loop for field in fields
-        for i from 0
-        when (> i 0) do (write-char #\, stream)
-        do (%write-csv-field (%sobject-field-value obj field slot-map) stream))
-  (write-char #\newline stream))
+(defun %write-csv-rows (buf records plan class)
+  (declare (type obuf buf) (type simple-vector plan))
+  (dolist (obj records)
+    (dotimes (i (length plan))
+      (when (> i 0) (%obuf-byte buf 44))
+      (%write-field buf (%column-value (svref plan i) obj class)))
+    (%obuf-byte buf 10)))
 
 (defun %bulk-column-names (records operation &optional external-id-field)
   "Determine the ordered list of CSV column headers for an ingest job.
@@ -205,39 +323,40 @@
                   all-fields)))))
 
 (defun %sobjects->csv (records fields)
-  "Convert list of RECORDS to a Bulk 2.0 CSV string.
-   Sequential for n ≤ *BULK-CSV-CHUNK-SIZE*; parallel via LPARALLEL:PMAPCAR
-   for larger lists.  Final assembly always uses a single stream write."
+  "Convert the list RECORDS to a Bulk 2.0 CSV with columns FIELDS, as an
+   exact-size UTF-8 octet vector.  Sequential for n <= *BULK-CSV-CHUNK-SIZE*;
+   larger lists are split into chunks written concurrently into their own
+   buffers on lparallel workers, then joined with a single copy."
   (declare (type list records fields))
-  (let* ((first     (car records))
-         (slot-map  (when first
-                      (gethash (class-name (class-of first)) *sobject-slot-maps*)))
-         (n         (length records)))
-    (if (<= n *bulk-csv-chunk-size*)
-        ;; ── Sequential: small payloads, minimal overhead ─────────────
-        (with-output-to-string (out)
-          (%write-csv-header fields out)
-          (dolist (obj records)
-            (%write-csv-row obj fields slot-map out)))
-        ;; ── Parallel: large payloads, rows generated concurrently ─────
-        (progn
-         (cl-sf/auth::%ensure-lparallel-kernel)
-         (let* ((chunks
-                (loop for i from 0 below n by *bulk-csv-chunk-size*
-                      collect (subseq records i (min (+ i *bulk-csv-chunk-size*) n))))
-               ;; Each worker serializes its chunk to a string fragment
-               (fragments
-                (lparallel:pmapcar
-                 (lambda (chunk)
-                   (with-output-to-string (s)
-                     (dolist (obj chunk)
-                       (%write-csv-row obj fields slot-map s))))
-                 chunks)))
-          ;; Join: header + fragments in order, single stream write
-          (with-output-to-string (out)
-            (%write-csv-header fields out)
-            (dolist (frag fragments)
-              (write-string frag out))))))))
+  (multiple-value-bind (class plan)
+      (if records
+          (%csv-column-plan (car records) fields)
+          (values nil (vector)))
+    (let* ((n          (length records))
+           (ncols      (length fields))
+           (chunk-size *bulk-csv-chunk-size*)
+           ;; ~12 bytes a cell is a cheap guess; buffers grow if it's low
+           (head       (%make-obuf (max 4096 (* (min n chunk-size) ncols 12)))))
+      (%write-csv-header head fields)
+      (if (<= n chunk-size)
+          (progn (%write-csv-rows head records plan class)
+                 (%obuf-octets head))
+          (let* ((rest   records)
+                 (chunks (loop while rest
+                               collect (loop repeat chunk-size while rest collect (pop rest)))))
+            (cl-sf/auth::%ensure-lparallel-kernel)
+            (let* ((bufs  (lparallel:pmapcar
+                           (lambda (chunk)
+                             (let ((buf (%make-obuf (max 4096 (* (length chunk) ncols 12)))))
+                               (%write-csv-rows buf chunk plan class)
+                               buf))
+                           chunks))
+                   (total (+ (obuf-fill head) (reduce #'+ bufs :key #'obuf-fill)))
+                   (out   (make-array total :element-type '(unsigned-byte 8)))
+                   (pos   0))
+              (dolist (buf (cons head bufs) out)
+                (replace out (obuf-bytes buf) :start1 pos :end2 (obuf-fill buf))
+                (incf pos (obuf-fill buf)))))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; CSV parser — for Bulk 2.0 result downloads
@@ -252,8 +371,6 @@
 ;;; 20; an AVX2 scan found the delimiters in 7 ms but changed the total
 ;;; not at all, since string construction dominates.)
 ;;; ──────────────────────────────────────────────────────────────────
-
-(deftype octets () '(simple-array (unsigned-byte 8) (*)))
 
 (defun %field-string (buf start end)
   "BUF[START,END) as a string: ASCII bytes copied directly, anything else
@@ -445,7 +562,7 @@
 (defun upload-job-data (job-id data &key (conn *connection*) (operation :insert) external-id-field)
   "Upload DATA to JOB-ID via HTTP PUT with Content-Type: text/csv.
    DATA may be:
-     - A string (CSV already serialized — used as-is, zero-copy)
+     - A string or octet vector (CSV already serialized — used as-is)
      - A list of SOBJECT instances (serialized automatically using OPERATION
        to pick the right CSV columns — must match the operation JOB-ID was
        created with)
@@ -454,6 +571,7 @@
    Returns T on success."
   (let ((csv (etypecase data
                (string data)
+               (octets data)
                (list   (%sobjects->csv data (%bulk-column-names data operation external-id-field))))))
     (api-request :put
                  (%bulk-path (format nil "/~A/batches" job-id))
