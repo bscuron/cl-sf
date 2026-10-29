@@ -71,11 +71,13 @@
 (defstruct bulk-result
   "The outcome of a completed Bulk 2.0 operation.
 
-   SUCCESSFUL  — list of SOBJECT instances.
-                 For update/delete: the original input objects (matched by Id).
-                 For insert/upsert: fresh SOBJECT instances with only Id set.
-   FAILED      — list of (sobject-or-nil . error-string) conses.
-                 CAR is NIL for insert failures (no Id to match back).
+   SUCCESSFUL  — list of SOBJECT instances: the very objects that were sent.
+                 Update/delete match by Id; insert (and upsert rows without an
+                 Id) match by the columns Salesforce echoes back, and the
+                 object receives its new Id.  A row that cannot be matched
+                 is a fresh SOBJECT with only the Id.
+   FAILED      — list of (sobject-or-nil . error-string) conses; the CAR is
+                 the object that was sent (NIL only if it cannot be matched).
    UNPROCESSED — list of SOBJECT instances not processed (e.g. job aborted).
    JOB-ID      — the Salesforce Bulk 2.0 job Id string."
   (successful  nil :type list)
@@ -640,76 +642,119 @@
                 (when (> failed 0)         '(:failed)))
         '(:successful :failed :unprocessed))))
 
-(defun %fetch-result-rows (conn job-id kinds)
+(defun %fetch-result-rows (conn job-id kinds columns)
   "Download and parse the result files named by KINDS (:successful :failed
    :unprocessed), concurrently when there is more than one.  Returns an
-   alist (kind . rows); each row is a vector of that file's needed columns."
-  (let* ((specs  '((:successful get-successful-results ("sf__Id" "sf__Created"))
-                   (:failed     get-failed-results     ("sf__Id" "sf__Error" "Id"))
-                   (:unprocessed get-unprocessed-results ("Id"))))
-         (wanted (remove-if-not (lambda (spec) (member (first spec) kinds)) specs))
-         (fetch  (lambda (spec)
-                   (cons (first spec)
-                         (%csv-select (funcall (second spec) job-id :conn conn)
-                                      (third spec))))))
-    (cond ((null wanted) nil)
-          ((null (cdr wanted)) (list (funcall fetch (first wanted))))
-          (t (cl-sf/auth::%ensure-lparallel-kernel)
-             (lparallel:pmapcar fetch wanted)))))
+   alist (kind . (names . rows)): each row is a vector of the file's needed
+   columns, NAMES (in order).  COLUMNS are the uploaded columns, which the
+   successful and failed files echo back; they are read too, for matching
+   inserted rows to the objects that were sent."
+  (flet ((names (&rest base)
+           (remove-duplicates (append base columns) :test #'string= :from-end t)))
+    (let* ((specs  `((:successful get-successful-results ,(names "sf__Id" "sf__Created"))
+                     (:failed     get-failed-results     ,(names "sf__Id" "sf__Error" "Id"))
+                     (:unprocessed get-unprocessed-results ("Id"))))
+           (wanted (remove-if-not (lambda (spec) (member (first spec) kinds)) specs))
+           (fetch  (lambda (spec)
+                     (list* (first spec) (third spec)
+                            (%csv-select (funcall (second spec) job-id :conn conn)
+                                         (third spec))))))
+      (cond ((null wanted) nil)
+            ((null (cdr wanted)) (list (funcall fetch (first wanted))))
+            (t (cl-sf/auth::%ensure-lparallel-kernel)
+               (lparallel:pmapcar fetch wanted))))))
 
-(defun %build-bulk-result (conn job-id input-records operation sf-type &optional status)
-  "Fetch the result CSVs and correlate them back to input sobjects.  STATUS,
-   the finished job's status, lets files that must be empty be skipped
-   (see %RESULTS-TO-FETCH); without it all three are downloaded.
+(defun %row-key (cells)
+  "One string identifying a row by its CELLS (length-prefixed, so no value can
+   run into the next)."
+  (with-output-to-string (out)
+    (dolist (cell cells)
+      (let ((cell (or cell "")))
+        (princ (length cell) out)
+        (write-char #\: out)
+        (write-string cell out)))))
 
-   For INSERT: successful rows → fresh sobjects with only Id set.
-   For UPDATE/DELETE: successful rows → input sobjects matched by Id (O(n) hash-map).
-   For UPSERT: mix of above based on sf__Created field.
-   Failed rows → (nil . error-string) conses (no reliable back-matching for insert).
-   Unprocessed rows → fresh generic sobjects."
-  (let* ((fetched      (%fetch-result-rows conn job-id (%results-to-fetch status)))
-         (success-rows (cdr (assoc :successful fetched)))
-         (failed-rows  (cdr (assoc :failed fetched)))
-         (unproc-rows  (cdr (assoc :unprocessed fetched)))
+(defun %upload-index (upload columns)
+  "UPLOAD (the CSV we sent, as octets) → a hash-table from each row's key to
+   the list of its row numbers, in upload order.  Rows are the records, in
+   the order they were given."
+  (let* ((rows  (coerce (%csv-select upload columns) 'simple-vector))
+         (index (make-hash-table :test #'equal :size (max 7 (length rows)))))
+    (loop for i from (1- (length rows)) downto 0
+          do (push i (gethash (%row-key (coerce (svref rows i) 'list)) index)))
+    index))
+
+(defun %build-bulk-result (conn job-id input-records operation sf-type
+                           &key status upload columns)
+  "Fetch the result CSVs and correlate them back to the objects that were sent.
+   STATUS, the finished job's status, lets files that must be empty be
+   skipped (see %RESULTS-TO-FETCH); without it all three are downloaded.
+
+   UPDATE/DELETE: rows match their input object by Id (O(n) hash-map).
+   INSERT (and UPSERT rows with no Id of their own): the result files echo
+   the columns we uploaded, so UPLOAD and COLUMNS — the CSV and its header —
+   let each result row be matched to the object whose row has the same cells.
+   Identical rows are paired in order, which is harmless.  The object gets
+   the new Id and is what the result holds.  A row that cannot be matched
+   (or any row, if UPLOAD is NIL) is a fresh SOBJECT with only the Id.
+   Failed rows are (object . error-string), the object NIL if unmatched.
+   Unprocessed rows are fresh generic sobjects."
+  (let* ((fetched      (%fetch-result-rows conn job-id (%results-to-fetch status) columns))
+         (success      (cdr (assoc :successful fetched)))
+         (failure      (cdr (assoc :failed fetched)))
+         (unproc-rows  (cddr (assoc :unprocessed fetched)))
+         (inputs       (coerce input-records 'simple-vector))
+         (index        (when (and upload columns (member operation '(:insert :upsert)))
+                         (%upload-index upload columns)))
          ;; Id → input-object map for update/delete/upsert
          (id->obj (when (member operation '(:update :delete :upsert))
-                    (let ((h (make-hash-table :test #'equal
-                                              :size (length input-records))))
-                      (dolist (obj input-records h)
-                        (when (sobject-id obj)
-                          (setf (gethash (sobject-id obj) h) obj)))))))
-    (make-bulk-result
-     :successful
-     (loop for row in success-rows
-           for sf-id   = (svref row 0)
-           for created = (svref row 1)
-           collect
-           (cond
-             ;; Insert or new upsert: no input object to match
-             ((or (eq operation :insert)
-                  (and (eq operation :upsert) (equal created "true")))
-              (make-instance 'sobject :id sf-id :type sf-type))
-             ;; Update/delete/upsert-update: look up by Id, else a fresh object
-             ((and id->obj sf-id)
-              (or (gethash sf-id id->obj)
-                  (make-instance 'sobject :id sf-id :type sf-type)))
-             (t (make-instance 'sobject :id sf-id :type sf-type))))
-     ;; Failed rows: (nil-or-obj . error-string)
-     :failed
-     ;; sf__Id is blank when the Id itself was bad (a nonexistent record); the
-     ;; row still echoes the Id we sent, in the original Id column
-     (loop for row in failed-rows
-           for sf-id = (let ((result-id (svref row 0)))
-                         (if (and result-id (plusp (length result-id))) result-id (svref row 2)))
-           for err   = (svref row 1)
-           collect (cons (when (and id->obj sf-id (not (equal sf-id "")))
-                           (gethash sf-id id->obj))
-                         (or err "Unknown error")))
-     ;; Unprocessed: fresh generic sobjects
-     :unprocessed
-     (loop for row in unproc-rows
-           collect (make-instance 'sobject :id (svref row 0) :type sf-type))
-     :job-id job-id)))
+                    (let ((h (make-hash-table :test #'equal :size (max 7 (length inputs)))))
+                      (loop for obj across inputs
+                            do (when (sobject-id obj)
+                                 (setf (gethash (sobject-id obj) h) obj)))
+                      h))))
+    (labels ((cell (row names name)
+               (let ((i (position name names :test #'string=)))
+                 (and i (svref row i))))
+             (by-content (row names)
+               ;; the object whose uploaded row has the same cells, claimed once
+               (when index
+                 (let* ((key (%row-key (mapcar (lambda (column) (cell row names column)) columns)))
+                        (i   (pop (gethash key index))))
+                   (and i (svref inputs i)))))
+             (nonblank (id) (and id (plusp (length id)) id)))
+      (make-bulk-result
+       :successful
+       (loop with names = (car success)
+             for row in (cdr success)
+             for sf-id   = (cell row names "sf__Id")
+             for created = (cell row names "sf__Created")
+             collect
+             (let ((object
+                     (or (and id->obj sf-id (not (and (eq operation :upsert) (equal created "true")))
+                              (gethash sf-id id->obj))
+                         (by-content row names))))
+               (cond (object
+                      ;; an inserted (or upsert-created) object learns its Id
+                      (unless (nonblank (sobject-id object))
+                        (setf (sobject-id object) sf-id))
+                      object)
+                     (t (make-instance 'sobject :id sf-id :type sf-type)))))
+       ;; Failed rows: (object-or-nil . error-string).  sf__Id is blank when
+       ;; the record never got an Id (a failed insert, or a nonexistent Id);
+       ;; the row still echoes the Id we sent, in the original Id column.
+       :failed
+       (loop with names = (car failure)
+             for row in (cdr failure)
+             for sf-id = (or (nonblank (cell row names "sf__Id")) (nonblank (cell row names "Id")))
+             collect (cons (or (and id->obj sf-id (gethash sf-id id->obj))
+                               (by-content row names))
+                           (or (cell row names "sf__Error") "Unknown error")))
+       ;; Unprocessed: fresh generic sobjects
+       :unprocessed
+       (loop for row in unproc-rows
+             collect (make-instance 'sobject :id (svref row 0) :type sf-type))
+       :job-id job-id))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; High-level CLOS-first operations
@@ -787,7 +832,8 @@ DEFINE-SOBJECT-CLASS)."))
                      :message (format nil "Bulk job ~A entered state ~A"
                                       job-id final-state)))
             ;; 5. Fetch + correlate results
-            (%build-bulk-result conn job-id records operation sf-type final-status)))
+            (%build-bulk-result conn job-id records operation sf-type
+                                :status final-status :upload csv :columns columns)))
       ;; On any error, attempt a clean abort so the job doesn't linger
       (error (e)
         (handler-case (abort-bulk-job job-id :conn conn) (error ()))
@@ -801,8 +847,9 @@ DEFINE-SOBJECT-CLASS)."))
    All objects should be the same type.
 
    Returns a BULK-RESULT:
-     - SUCCESSFUL  — fresh SOBJECT instances with Salesforce-assigned Ids
-     - FAILED      — (nil . error-string) conses for each failed record
+     - SUCCESSFUL  — the objects you passed, each now holding its Salesforce Id
+                     (matched by content; see %BUILD-BULK-RESULT)
+     - FAILED      — (object . error-string) conses for each failed record
      - UNPROCESSED — SOBJECT instances not yet processed
 
    For automatic REST/Bulk routing see DATABASE-INSERT.

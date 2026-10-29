@@ -858,7 +858,7 @@
          :failed (format nil "\"sf__Id\",\"sf__Error\",\"Id\",\"Name\"~%\"\",\"INVALID_CROSS_REFERENCE_KEY:invalid cross reference id:--\",\"006000000000000AAA\",\"ghost\"~%")
          :unprocessed "")
       (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list real ghost) :update "Opportunity"
-                                                    (job-status "JobComplete" :processed 2 :failed 1))))
+                                                    :status (job-status "JobComplete" :processed 2 :failed 1))))
         (is eq real (first (cl-sf/bulk:bulk-result-successful result)))
         (is = 1 (length (cl-sf/bulk:bulk-result-failed result)))
         (is eq ghost (car (first (cl-sf/bulk:bulk-result-failed result))))

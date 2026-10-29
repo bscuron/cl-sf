@@ -547,7 +547,7 @@ y") ("z" "w"))
     (with-result-downloads (log :success (format nil "sf__Id,sf__Created~%001A,false~%"))
       (let ((result (cl-sf/bulk::%build-bulk-result
                      nil "J" (list (make-instance 'cl-sf/objects:sobject :id "001A" :type "Account"))
-                     :update "Account" (job-status "JobComplete" :processed 1 :failed 0))))
+                     :update "Account" :status (job-status "JobComplete" :processed 1 :failed 0))))
         (is equal '(:successful) (mapcar #'first log))
         (is = 1 (length (cl-sf/bulk:bulk-result-successful result)))
         (false (cl-sf/bulk:bulk-result-failed result))
@@ -561,7 +561,7 @@ y") ("z" "w"))
                                 :failed (format nil "sf__Id,sf__Error~%,boom~%"))
       (let* ((start (get-internal-real-time))
              (result (cl-sf/bulk::%build-bulk-result nil "J" '() :insert "Account"
-                                                     (job-status "JobComplete" :processed 2 :failed 1)))
+                                                     :status (job-status "JobComplete" :processed 2 :failed 1)))
              (elapsed (/ (- (get-internal-real-time) start) internal-time-units-per-second)))
         (is equal '(:failed :successful) (sort (mapcar #'first log) #'string<))
         (is = 2 (length (remove-duplicates (mapcar #'second log))) "two different worker threads")
@@ -663,3 +663,141 @@ y") ("z" "w"))
       (fail (cl-sf/bulk::%run-bulk-operation nil :insert (list (make-widget :label "A")))
             'cl-sf/bulk:bulk-job-failed-error)
       (is equal '((:abort "J2")) log))))
+
+;;; ── Bulk insert results map back to the objects that were sent ────
+
+(define-test insert-matching
+  :parent bulk
+  :description "Result rows matched to input objects by the columns Salesforce echoes.")
+
+(defun upload-of (objects columns)
+  (cl-sf/bulk::%sobjects->csv objects columns))
+
+(defun escaped (cell)
+  (with-output-to-string (out)
+    (loop for c across cell do (when (char= c #\") (write-char #\" out)) (write-char c out))))
+
+(defun result-csv (header &rest rows)
+  "HEADER (a list of column names) and ROWS (lists of cells) as a quoted CSV string."
+  (with-output-to-string (out)
+    (flet ((line (cells) (format out "~{\"~A\"~^,~}~%" (mapcar #'escaped cells))))
+      (line header)
+      (dolist (row rows) (line row)))))
+
+(define-test insert-matching/results-in-any-order-map-to-their-own-objects
+  :parent insert-matching
+  (let* ((a (make-widget :label "alpha" :amount 1))
+         (b (make-widget :label "beta" :amount 2))
+         (c (make-widget :label "gamma" :amount 3))
+         (columns '("Label__c" "Amount__c"))
+         (header (list "sf__Id" "sf__Created" "Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv header '("001C" "true" "gamma" "3") '("001A" "true" "alpha" "1") '("001B" "true" "beta" "2"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a b c) :insert "Widget"
+                                                    :upload (upload-of (list a b c) columns) :columns columns)))
+        (is equal '("001A" "001B" "001C") (mapcar #'cl-sf/objects:sobject-id (list a b c)) "Ids landed on the right objects")
+        (is = 3 (length (cl-sf/bulk:bulk-result-successful result)))
+        (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list c a b))
+              "the result holds the very objects sent, in the order Salesforce answered")))))
+
+(define-test insert-matching/failed-rows-come-back-with-their-objects
+  :parent insert-matching
+  (let* ((good (make-widget :label "fine" :amount 1))
+         (bad  (make-widget :label "broken" :amount 2))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c") '("001G" "true" "fine" "1"))
+         :failed (result-csv '("sf__Id" "sf__Error" "Label__c" "Amount__c")
+                             '("" "FIELD_CUSTOM_VALIDATION_EXCEPTION:nope" "broken" "2"))
+         :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list good bad) :insert "Widget"
+                                                    :upload (upload-of (list good bad) columns) :columns columns)))
+        (is string= "001G" (cl-sf/objects:sobject-id good))
+        (false (cl-sf/objects:sobject-id bad) "a failed insert gets no Id")
+        (is eq bad (car (first (cl-sf/bulk:bulk-result-failed result))))
+        (true (search "FIELD_CUSTOM_VALIDATION_EXCEPTION" (cdr (first (cl-sf/bulk:bulk-result-failed result)))))))))
+
+(define-test insert-matching/identical-rows-each-get-their-own-id
+  :parent insert-matching
+  (let* ((one (make-widget :label "same" :amount 1))
+         (two (make-widget :label "same" :amount 1))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                              '("001X" "true" "same" "1") '("001Y" "true" "same" "1"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list one two) :insert "Widget"
+                                                    :upload (upload-of (list one two) columns) :columns columns)))
+        (is equal '("001X" "001Y") (mapcar #'cl-sf/objects:sobject-id (list one two)))
+        (true (and (eq one (first (cl-sf/bulk:bulk-result-successful result)))
+                   (eq two (second (cl-sf/bulk:bulk-result-successful result)))))))))
+
+(define-test insert-matching/awkward-values-match
+  :parent insert-matching
+  (let* ((labels (list "plain" "with, comma" (format nil "multi~%line") "say \"hi\"" "  padded  "
+                       "café ☃ 日本" "tail,\"" "" "a:1"))
+         (objects (mapcar (lambda (l) (make-widget :label l :amount 7)) labels))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (apply #'result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c")
+                         (loop for l in (reverse labels) for i from 0
+                               collect (list (format nil "001~D" i) "true" l "7")))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" objects :insert "Widget"
+                                                    :upload (upload-of objects columns) :columns columns)))
+        (is = (length labels) (length (cl-sf/bulk:bulk-result-successful result)))
+        (true (every (lambda (o) (member o objects :test #'eq)) (cl-sf/bulk:bulk-result-successful result))
+              "every result is one of ours, none a stand-in")
+        (is = (length labels) (length (remove nil (mapcar #'cl-sf/objects:sobject-id objects))))))))
+
+(define-test insert-matching/a-row-that-does-not-match-falls-back-to-a-fresh-object
+  :parent insert-matching
+  (let* ((sent (make-widget :label "sent" :amount 1))
+         (columns '("Label__c" "Amount__c")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c") '("001Z" "true" "CHANGED" "1"))
+         :failed "" :unprocessed "")
+      (let* ((result (cl-sf/bulk::%build-bulk-result nil "J" (list sent) :insert "Widget"
+                                                     :upload (upload-of (list sent) columns) :columns columns))
+             (stand-in (first (cl-sf/bulk:bulk-result-successful result))))
+        (false (eq stand-in sent))
+        (is string= "001Z" (cl-sf/objects:sobject-id stand-in))
+        (is string= "Widget" (cl-sf/objects:sobject-type stand-in))
+        (false (cl-sf/objects:sobject-id sent))))))
+
+(define-test insert-matching/without-the-upload-it-is-the-old-behaviour
+  :parent insert-matching
+  (let ((sent (make-widget :label "sent")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created") '("001Q" "true")) :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list sent) :insert "Widget")))
+        (false (eq sent (first (cl-sf/bulk:bulk-result-successful result))))
+        (false (cl-sf/objects:sobject-id sent))))))
+
+(define-test insert-matching/upsert-rows-without-an-id-are-matched-by-content
+  :parent insert-matching
+  (let* ((existing (make-widget :label "old" :amount 1))
+         (fresh    (make-widget :label "new" :amount 2))
+         (columns (cl-sf/bulk::%bulk-column-names (list existing fresh) :upsert "Id")))
+    (setf (cl-sf/objects:sobject-id existing) "001OLD")
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Id" "Label__c" "Amount__c" "Active__c")
+                              '("001NEW" "true" "" "new" "2" "") '("001OLD" "false" "001OLD" "old" "1" ""))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list existing fresh) :upsert "Widget"
+                                                    :upload (upload-of (list existing fresh) columns)
+                                                    :columns columns)))
+        (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list fresh existing)))
+        (is string= "001NEW" (cl-sf/objects:sobject-id fresh) "the created record's object learns its Id")
+        (is string= "001OLD" (cl-sf/objects:sobject-id existing))))))
+
+(define-test insert-matching/update-and-delete-still-match-by-id
+  :parent insert-matching
+  (let* ((a (make-instance 'cl-sf/objects:sobject :id "001A" :type "Account"))
+         (columns '("Id")))
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Id") '("001A" "false" "001A")) :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a) :delete "Account"
+                                                    :upload (upload-of (list a) columns) :columns columns)))
+        (is eq a (first (cl-sf/bulk:bulk-result-successful result)))))))
