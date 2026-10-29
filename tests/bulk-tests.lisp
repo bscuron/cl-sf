@@ -603,7 +603,7 @@ y") ("z" "w"))
                            (job-status "JobComplete" :processed 1 :failed 0))))
       (with-result-downloads (log :success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c" "Active__c")
                                                        '("001N" "true" "A" "1" "")))
-        (let* ((result (cl-sf/bulk::%run-bulk-operation nil :insert objs :refresh nil))
+        (let* ((result (cl-sf/bulk::%run-bulk-operation nil :insert objs))
                (events  (reverse log))
                (pos (lambda (event) (position event events :key (lambda (e) (if (consp e) (car e) e))))))
           (true (< (funcall pos :create-start) (funcall pos :csv-end))
@@ -950,125 +950,66 @@ y") ("z" "w"))
         (is equal '("001A" "001B") (mapcar #'cl-sf/objects:sobject-id (list a b)))
         (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list a b)))))))
 
-;;; ── Reading the written records back ──────────────────────────────
+;;; ── Only the Id is filled in; nothing else about the objects changes ──
 
-(define-test refresh
-  :parent bulk
-  :description "Objects updated to what Salesforce stored.")
+(define-test insert-matching/only-the-id-is-set-on-inserted-objects
+  :parent insert-matching
+  (let* ((a (make-widget :label "  padded  " :amount "1.50" :active "yes"))
+         (columns '("Label__c" "Amount__c" "Active__c")))
+    (with-stubbed-results
+        ;; Salesforce echoes the number differently (1.5) -- the object still keeps what it was given
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c" "Active__c")
+                              '("001A" "true" "padded" "1.5" "yes"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a) :insert "Widget"
+                                                    :upload (upload-of (list a) columns) :columns columns)))
+        (is string= "001A" (cl-sf/objects:sobject-id a))
+        (is string= "  padded  " (bulk-test-widget-label a))
+        (is string= "1.50" (bulk-test-widget-amount a))
+        (is string= "yes" (bulk-test-widget-active a))
+        (false (cl-sf/objects:sobject-raw a) "no record is attached either")
+        (is eq a (first (cl-sf/bulk:bulk-result-successful result)))))))
 
-(defmacro with-stored-records ((log &key records error-on) &body body)
-  "Stub %QUERY-RECORDS: log each SOQL text and answer with RECORDS (a list of
-   hash-tables); when ERROR-ON is a substring, a query containing it fails."
-  `(with-fdefinitions ((cl-sf/api::%query-records
-                        (lambda (conn soql &key all coercer)
-                          (declare (ignore conn all coercer))
-                          (bulk-log soql ,log)
-                          (when (and ,error-on (search ,error-on soql)) (error "no read access"))
-                          (coerce (remove-if-not (lambda (h) (search (gethash "Id" h) soql)) ,records)
-                                  'simple-vector))))
-     ,@body))
-
-(defun stored (id &rest pairs)
-  (let ((h (make-hash-table :test #'equal)))
-    (setf (gethash "Id" h) id)
-    (loop for (k v) on pairs by #'cddr do (setf (gethash k h) v))
-    h))
-
-(define-test refresh/objects-take-what-salesforce-stored
-  :parent refresh
-  (let ((log '())
-        (a (make-widget :label "  padded  " :amount "1.50" :active "yes"))
-        (b (make-widget :label "kept")))
-    (setf (cl-sf/objects:sobject-id a) "001A" (cl-sf/objects:sobject-id b) "001B")
-    (with-stored-records (log :records (list (stored "001A" "Label__c" "padded" "Amount__c" 1.5d0 "Active__c" 'null)
-                                             (stored "001B" "Label__c" "kept" "Amount__c" 'null)))
-      (cl-sf/bulk::%refresh-objects nil "BulkTestWidget__c" '("Label__c" "Amount__c" "Active__c") (list a b))
-      (is string= "padded" (bulk-test-widget-label a) "trimmed, as stored")
-      (is = 1.5d0 (bulk-test-widget-amount a) "\"1.50\" is the number it became")
-      (false (bulk-test-widget-active a) "a field Salesforce holds as null is emptied")
-      (is string= "padded" (gethash "Label__c" (cl-sf/objects:sobject-raw a)) "the raw record is Salesforce's")
-      (is string= "kept" (bulk-test-widget-label b))
-      ;; one query, for both Ids, naming the fields
-      (is = 1 (length log))
-      (true (search "SELECT Id, Label__c, Amount__c, Active__c FROM BulkTestWidget__c WHERE Id IN ('001A','001B')"
-                    (first log))))))
-
-(define-test refresh/fields-the-query-did-not-return-are-left-alone
-  :parent refresh
-  (let ((log '()) (a (make-widget :label "mine" :amount 5)))
-    (setf (cl-sf/objects:sobject-id a) "001A")
-    (with-stored-records (log :records (list (stored "001A" "Label__c" "theirs")))
-      (cl-sf/bulk::%refresh-objects nil "BulkTestWidget__c" '("Label__c" "Amount__c") (list a))
-      (is string= "theirs" (bulk-test-widget-label a))
-      (is = 5 (bulk-test-widget-amount a)))))
-
-(define-test refresh/queries-are-chunked-by-300-ids
-  :parent refresh
-  (let* ((log '())
-         (objects (loop for i below 650
-                        collect (let ((o (make-widget :label "x")))
-                                  (setf (cl-sf/objects:sobject-id o) (format nil "001~5,'0D" i))
-                                  o))))
-    (with-stored-records (log :records (mapcar (lambda (o) (stored (cl-sf/objects:sobject-id o) "Label__c" "stored"))
-                                               objects))
-      (cl-sf/bulk::%refresh-objects nil "BulkTestWidget__c" '("Label__c") objects)
-      (is = 3 (length log))
-      (is equal '(50 300 300)
-          (sort (mapcar (lambda (soql) (/ (count #\' soql :test #'char=) 2)) log) #'<)
-          "ids per query")
-      (true (every (lambda (o) (equal "stored" (bulk-test-widget-label o))) objects)))))
-
-(define-test refresh/a-failed-read-is-a-warning-and-the-other-chunks-still-apply
-  :parent refresh
-  (let* ((log '()) (warned nil)
-         (objects (loop for i below 400
-                        collect (let ((o (make-widget :label "sent")))
-                                  (setf (cl-sf/objects:sobject-id o) (format nil "001~5,'0D" i))
-                                  o))))
-    (with-stored-records (log :error-on "00100399"          ; only the second chunk's query mentions this
-                              :records (mapcar (lambda (o) (stored (cl-sf/objects:sobject-id o) "Label__c" "stored"))
-                                               objects))
-      (handler-bind ((warning (lambda (w) (setf warned t) (muffle-warning w))))
-        (cl-sf/bulk::%refresh-objects nil "BulkTestWidget__c" '("Label__c") objects))
-      (true warned)
-      (is string= "stored" (bulk-test-widget-label (first objects)) "first chunk applied")
-      (is string= "sent" (bulk-test-widget-label (car (last objects))) "failed chunk untouched"))))
-
-(define-test refresh/bulk-operations-refresh-by-default-and-can-opt-out
-  :parent refresh
-  (flet ((run (&rest keys)
-           (let ((log '()) (obj (make-widget :label "  padded  " :amount 1)))
-             (with-fdefinitions ((cl-sf/bulk::create-bulk-job (lambda (type op &key conn external-id-field-name)
-                                                                (declare (ignore type op conn external-id-field-name))
-                                                                (job "J1")))
-                                 (cl-sf/api:api-request (lambda (&rest args) (declare (ignore args)) t))
-                                 (cl-sf/bulk::close-bulk-job (lambda (id &key conn) (declare (ignore id conn)) t))
-                                 (cl-sf/bulk::get-bulk-job (lambda (id &key conn) (declare (ignore id conn))
-                                                             (job-status "JobComplete" :processed 1 :failed 0))))
-               (with-result-downloads (log :success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c" "Active__c")
-                                                                '("001N" "true" "  padded  " "1" "")))
-                 (with-stored-records (log :records (list (stored "001N" "Label__c" "padded" "Amount__c" 1
-                                                                         "Active__c" 'null)))
-                   (apply #'cl-sf/bulk::%run-bulk-operation nil :insert (list obj) keys)
-                   (values obj (count-if #'stringp log))))))))
-    (multiple-value-bind (obj queries) (run)
-      (is = 1 queries "one read-back query")
-      (is string= "padded" (bulk-test-widget-label obj) "the object now holds what Salesforce stored"))
-    (multiple-value-bind (obj queries) (run :refresh nil)
-      (is = 0 queries)
-      (is string= "  padded  " (bulk-test-widget-label obj)))))
-
-(define-test refresh/deletes-are-not-read-back
-  :parent refresh
-  (let ((log '()) (obj (make-instance 'cl-sf/objects:sobject :id "001D" :type "Account")))
+(define-test insert-matching/inserting-makes-no-requests-beyond-the-job
+  :parent insert-matching
+  (let ((queried nil) (log '()) (obj (make-widget :label "A" :amount 1)))
     (with-fdefinitions ((cl-sf/bulk::create-bulk-job (lambda (type op &key conn external-id-field-name)
                                                        (declare (ignore type op conn external-id-field-name))
                                                        (job "J1")))
                         (cl-sf/api:api-request (lambda (&rest args) (declare (ignore args)) t))
                         (cl-sf/bulk::close-bulk-job (lambda (id &key conn) (declare (ignore id conn)) t))
                         (cl-sf/bulk::get-bulk-job (lambda (id &key conn) (declare (ignore id conn))
-                                                    (job-status "JobComplete" :processed 1 :failed 0))))
-      (with-result-downloads (log :success (result-csv '("sf__Id" "sf__Created" "Id") '("001D" "false" "001D")))
-        (with-stored-records (log :records '())
-          (cl-sf/bulk::%run-bulk-operation nil :delete (list obj))
-          (is = 0 (count-if #'stringp log)))))))
+                                                    (job-status "JobComplete" :processed 1 :failed 0)))
+                        (cl-sf/api::%query-records (lambda (&rest args) (declare (ignore args)) (setf queried t) #())))
+      (with-result-downloads (log :success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c" "Active__c")
+                                                          '("001N" "true" "A" "1" "")))
+        (cl-sf/bulk::%run-bulk-operation nil :insert (list obj))
+        (is string= "001N" (cl-sf/objects:sobject-id obj))
+        (false queried "no read-back query")))))
+
+(define-test insert-matching/only-columns-with-data-are-compared
+  :parent insert-matching
+  (let* ((a (make-widget :label "a"))
+         (b (make-widget :label "b"))
+         (columns '("Label__c" "Amount__c" "Active__c")))
+    ;; Amount__c and Active__c are empty in every uploaded row
+    (is equal '("Label__c") (cl-sf/bulk::%active-columns (upload-of (list a b) columns) columns))
+    ;; ...so a value Salesforce fills in on its own (a default) cannot stop a row matching
+    (with-stubbed-results
+        (:success (result-csv '("sf__Id" "sf__Created" "Label__c" "Amount__c" "Active__c")
+                              '("001B" "true" "b" "99" "Y") '("001A" "true" "a" "99" "Y"))
+         :failed "" :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list a b) :insert "Widget"
+                                                    :upload (upload-of (list a b) columns) :columns columns)))
+        (is equal '("001A" "001B") (mapcar #'cl-sf/objects:sobject-id (list a b)))
+        (true (every #'eq (cl-sf/bulk:bulk-result-successful result) (list b a)))))))
+
+(define-test insert-matching/active-columns-sees-quoted-and-multiline-values
+  :parent insert-matching
+  (let* ((rows (list (make-widget :label "")
+                     (make-widget :label "x" :amount nil :active (format nil "multi~%line"))))
+         (columns '("Label__c" "Amount__c" "Active__c")))
+    (is equal '("Label__c" "Active__c")
+        (cl-sf/bulk::%active-columns (upload-of rows columns) columns))
+    (is equal '() (cl-sf/bulk::%active-columns (upload-of (list (make-widget)) columns) columns))
+    (is equal '() (cl-sf/bulk::%active-columns (upload-of '() columns) columns))))

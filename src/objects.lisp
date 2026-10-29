@@ -375,30 +375,17 @@
         (setf (gethash name *sobject-classes*) :failed)
         nil))))
 
-(defun %fill-slots (object hash class-name refresh)
+(defun %fill-slots (object hash class-name)
   "Set OBJECT's field slots from the record HASH, converting date and datetime
-   text to timestamps.  A JSON null leaves a slot alone.  With REFRESH, the
-   record is Salesforce's current word on the object: a null empties the slot,
-   and a field HASH does not contain at all is left as it is."
+   text to timestamps.  A JSON null leaves a slot alone."
   (let ((kinds (gethash class-name *sobject-field-kinds*)))
     (dolist (entry (gethash class-name *sobject-slot-maps*))
-      (let ((sf-name (car entry)))
-        (multiple-value-bind (val present) (gethash sf-name hash)
-          (cond ((or (null val) (eq val 'null))
-                 (when (and refresh present)
-                   (setf (slot-value object (cdr entry)) nil)))
-                (t (setf (slot-value object (cdr entry))
-                         (let ((kind (and kinds (gethash sf-name kinds))))
-                           (if kind (%from-salesforce val kind) val))))))))))
-
-(defun %refresh-sobject (object hash)
-  "Bring OBJECT in line with HASH, a record just read from Salesforce: its field
-   slots, and the raw record."
-  (let ((class-name (class-name (class-of object))))
-    (when (gethash class-name *sobject-slot-maps*)
-      (%fill-slots object hash class-name t))
-    (setf (sobject-raw object) hash)
-    object))
+      (let* ((sf-name (car entry))
+             (val     (gethash sf-name hash)))
+        (unless (or (null val) (eq val 'null))
+          (setf (slot-value object (cdr entry))
+                (let ((kind (and kinds (gethash sf-name kinds))))
+                  (if kind (%from-salesforce val kind) val))))))))
 
 (defun %hash->sobject-fields (hash hint-type conn)
   "HASH as a SOBJECT with its field slots filled; see HASH->SOBJECT, which
@@ -434,7 +421,7 @@
         (let* ((obj      (make-instance class :id id :type sf-type :raw hash))
                (slot-map (gethash (class-name class) *sobject-slot-maps*)))
           (when slot-map
-            (%fill-slots obj hash (class-name class) nil))
+            (%fill-slots obj hash (class-name class)))
           obj)
         ;; ── Generic fallback: unknown type, or no CONN to describe it ─
         (make-instance 'sobject :id id :type sf-type :raw hash))))
@@ -1367,8 +1354,7 @@ Did you mean DATABASE-INSERT?"))
                       objects))))))
 
 (defun database-insert (objects &key (conn *connection*)
-                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*)
-                                  (refresh t))
+                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Insert OBJECTS (one SOBJECT or a sequence of them, all one type) into
    Salesforce.  Each object's SOBJECT-ID is set from the response.
 
@@ -1376,11 +1362,10 @@ Did you mean DATABASE-INSERT?"))
    through the sObject Collections API — 200 records per request, several
    requests in parallel — and OBJECTS is returned.  A longer sequence is
    sent through Bulk 2.0 and a BULK-RESULT is returned.  BULK-THRESHOLD 0
-   always uses Bulk; NIL never does.  On the Bulk route the objects are
-   matched to their result rows; if some rows cannot be matched,
-   BULK-MATCH-ERROR is signalled.  Afterwards each object is re-read from
-   Salesforce so it holds what was actually stored (Salesforce trims text,
-   rewrites numbers, runs triggers); pass :REFRESH NIL to skip that read.
+   always uses Bulk; NIL never does.  On the Bulk route each inserted object
+   is matched to its result row and receives its new Id (no further request
+   is made, and no other field changes); if some rows cannot be matched,
+   BULK-MATCH-ERROR is signalled.
 
    If any record is rejected, every other record is still processed, then
    SF-DML-ERROR is signalled; its SF-DML-ERROR-FAILURES lists each failed
@@ -1392,11 +1377,10 @@ Did you mean DATABASE-INSERT?"))
   (%dml objects conn bulk-threshold
         (lambda (o) (%insert-one o conn))
         (lambda (list) (%collection-dml :insert list conn))
-        (lambda (list) (cl-sf/bulk:bulk-insert list :conn conn :refresh refresh))))
+        (lambda (list) (cl-sf/bulk:bulk-insert list :conn conn))))
 
 (defun database-update (objects &key (conn *connection*)
-                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*)
-                                  (refresh t))
+                                  (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Update OBJECTS (one SOBJECT or a sequence, all one type), each of which
    must have an SOBJECT-ID.  Only non-NIL slots are sent.  Routing, return
    value and failures as for DATABASE-INSERT.
@@ -1407,12 +1391,11 @@ Did you mean DATABASE-INSERT?"))
   (%dml objects conn bulk-threshold
         (lambda (o) (%update-one o conn))
         (lambda (list) (%collection-dml :update list conn))
-        (lambda (list) (cl-sf/bulk:bulk-update list :conn conn :refresh refresh))))
+        (lambda (list) (cl-sf/bulk:bulk-update list :conn conn))))
 
 (defun database-upsert (objects external-id-field
                         &key (conn *connection*)
-                          (bulk-threshold cl-sf/bulk:*bulk-threshold*)
-                          (refresh t))
+                          (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Upsert OBJECTS (one SOBJECT or a sequence, all one type), matching on
    EXTERNAL-ID-FIELD (the API field name string, e.g. \"External_Id__c\").
    Routing, return value and failures as for DATABASE-INSERT.
@@ -1422,7 +1405,7 @@ Did you mean DATABASE-INSERT?"))
   (%dml objects conn bulk-threshold
         (lambda (o) (%upsert-one o external-id-field conn))
         (lambda (list) (%collection-dml :upsert list conn :external-id-field external-id-field))
-        (lambda (list) (cl-sf/bulk:bulk-upsert list external-id-field :conn conn :refresh refresh))))
+        (lambda (list) (cl-sf/bulk:bulk-upsert list external-id-field :conn conn))))
 
 (defun database-delete (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
