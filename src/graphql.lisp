@@ -391,27 +391,51 @@
                              message)))
                errors)))
 
-(defun %gql-flatten-value (v)
+(defun %gql-typed (record type-name)
+  "RECORD (a flattened hash) marked with its sObject type, as a SOQL record
+   would be, so HASH->SOBJECT can build the right class for it."
+  (when (and type-name (not (nth-value 1 (gethash "attributes" record))))
+    (let ((attributes (make-hash-table :test #'equal)))
+      (setf (gethash "type" attributes) type-name
+            (gethash "attributes" record) attributes)))
+  record)
+
+(defun %gql-flatten-value (key v type conn)
   (cond ((hash-table-p v)
          (cond ((nth-value 1 (gethash "edges" v))      ; a child connection
-                (let ((records (map 'vector (lambda (edge) (%gql-flatten (gethash "node" edge)))
-                                    (gethash "edges" v))))
-                  (let ((wrapper (make-hash-table :test #'equal)))
+                (multiple-value-bind (name kind data) (if type (%schema-lookup type key) nil)
+                  (declare (ignore name))
+                  (let* ((child-type (and (eq kind :child) (%gql-type conn data)))
+                         (records (map 'vector
+                                       (lambda (edge)
+                                         (%gql-typed (%gql-flatten (gethash "node" edge) child-type conn)
+                                                     (and child-type (gqt-name child-type))))
+                                       (gethash "edges" v)))
+                         (wrapper (make-hash-table :test #'equal)))
                     (setf (gethash "totalSize" wrapper) (length records)
                           (gethash "done" wrapper) t
                           (gethash "records" wrapper) records)
                     wrapper)))
                ((and (= (hash-table-count v) 1) (nth-value 1 (gethash "value" v)))
-                (%gql-flatten-value (gethash "value" v)))   ; { value } → value
-               (t (%gql-flatten v))))
+                (%gql-flatten-value key (gethash "value" v) nil conn))   ; { value } → value
+               (t                                       ; a parent record
+                (multiple-value-bind (name kind data) (if type (%schema-lookup type key) nil)
+                  (declare (ignore name))
+                  (let ((parent-type (and (eq kind :parent) data (null (cdr data))
+                                          (%gql-type conn (car data)))))
+                    (%gql-typed (%gql-flatten v parent-type conn)
+                                (cond (parent-type (gqt-name parent-type))
+                                      ((stringp (gethash "__typename" v)) (gethash "__typename" v)))))))))
         ((eq v 'null) nil)
         (t v)))
 
-(defun %gql-flatten (node)
+(defun %gql-flatten (node type conn)
   "A GraphQL record as the REST-style hash the rest of cl-sf expects: field
-   wrappers unwrapped, child connections turned into {totalSize, done, records}."
+   wrappers unwrapped, child connections turned into {totalSize, done, records},
+   and related records marked with their sObject type (from TYPE's metadata,
+   or the record's __typename).  TYPE is NODE's GQL-TYPE, if known."
   (let ((out (make-hash-table :test #'equal :size (max 7 (hash-table-count node)))))
-    (maphash (lambda (k v) (setf (gethash k out) (%gql-flatten-value v))) node)
+    (maphash (lambda (k v) (setf (gethash k out) (%gql-flatten-value k v type conn))) node)
     out))
 
 (defun %gql-run (roots)
@@ -456,7 +480,7 @@
                                 (let ((type-name (gqt-name (gqs-type state))))
                                   (push (map 'vector
                                              (lambda (edge)
-                                               (hash->sobject (%gql-flatten (gethash "node" edge))
+                                               (hash->sobject (%gql-flatten (gethash "node" edge) (gqs-type state) conn)
                                                               type-name conn))
                                              (gethash "edges" page))
                                         (gqs-pages state)))

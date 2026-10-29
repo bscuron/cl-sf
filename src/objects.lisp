@@ -191,6 +191,14 @@
             :initform nil
             :type     (or string null)
             :documentation "Salesforce API name of the sObject type, e.g. \"Account\".")
+   (sf-related :initform nil
+               :accessor %sobject-related
+               :documentation
+               "Alist (relationship-name . value) of the related records the query
+                returned: a CLOS object for a parent record, a vector of CLOS objects
+                for a child list.  Only relationships present in the response appear.
+                Read it with SOBJECT-RELATED, or with the <class>-<relationship>
+                readers generated for each class.")
    (sf-raw  :initarg  :raw
             :accessor sobject-raw
             :initform nil
@@ -209,24 +217,29 @@
 (defun %print-to-string (obj)
   (with-output-to-string (s) (print-object obj s)))
 
+(defun sobject-related (object &optional name)
+  "The related records OBJECT's query brought back.  With NAME (a Salesforce
+   relationship name, e.g. \"Contact\" or \"Contacts\"; case does not matter)
+   returns that relationship's value: a CLOS object for a parent record, a
+   vector of CLOS objects for a child list, or NIL if it is empty or was not
+   queried.  Without NAME, the whole alist of (relationship-name . value).
+
+   Generated classes also have a reader per relationship:
+     (user-contact user)         ; a parent: one CLOS object
+     (account-contacts account)  ; a child list: a vector of CLOS objects"
+  (if name
+      (cdr (assoc name (%sobject-related object) :test #'string-equal))
+      (%sobject-related object)))
+
 (defun %sobject-print-field-value (v)
-  "Render one SOBJECT-RAW field value for PRINT-OBJECT, recursively —
-   a nested record should print exactly as it would on its own.
+  "Render one field value for PRINT-OBJECT: related records print exactly as
+   they would on their own, a child list as a bracketed list of them.
 
-   Two hash-table shapes occur in real Salesforce responses:
-     - A relationship record (dot-path fields like CreatedBy.Name):
-       {\"attributes\": {\"type\": \"User\", ...}, \"Name\": \"...\"}
-       → converted via HASH->SOBJECT (no CONN — printing must stay a pure,
-       network-free operation, so an unregistered type just prints generic)
-       and printed the same way any other sobject would be.
-     - A child sub-query wrapper (e.g. (SELECT Id FROM Contacts) nested in
-       a field list): {\"totalSize\": N, \"done\": T, \"records\": [...]}
-       → each element of RECORDS gets the same recursive treatment,
-       joined as a bracketed list.
-
-   STRING is checked before VECTOR — strings are vectors in Lisp, and
-   would otherwise get treated as a sub-query array."
-  (etypecase v
+   A raw hash-table can still reach here (a record built by hand with nested
+   data); the two Salesforce shapes are a relationship record
+   {\"attributes\": {...}, ...} and a child wrapper {\"records\": [...]}."
+  (typecase v
+    (sobject (%print-to-string v))
     (hash-table
      (let ((records (gethash "records" v)))
        (if records
@@ -235,8 +248,11 @@
                          collect (%print-to-string (hash->sobject r))))
            (%print-to-string (hash->sobject v)))))
     (string v)
-    (vector (format nil "[~A records]" (length v)))
-    (t      v)))
+    (vector (if (every (lambda (x) (typep x 'sobject)) v)
+                (format nil "[~{~A~^, ~}]" (map 'list #'%print-to-string v))
+                (format nil "[~A records]" (length v))))
+    (symbol (if (eq v 'null) nil v))      ; a JSON null
+    (t v)))
 
 (defmethod print-object ((obj sobject) stream)
   ;; SOBJECT-RAW holds exactly the fields actually returned by the query
@@ -261,10 +277,12 @@
                         unless (equal k "attributes")
                         collect (format nil "~A=~A" k
                                         (%sobject-print-field-value
-                                         (let ((entry (and slot-map (assoc k slot-map :test #'equal))))
-                                           (if (and entry (slot-boundp obj (cdr entry)))
-                                               (slot-value obj (cdr entry))
-                                               v)))))))
+                                         (let ((related (assoc k (%sobject-related obj) :test #'equal))
+                                               (entry   (and slot-map (assoc k slot-map :test #'equal))))
+                                           (cond (related (cdr related))
+                                                 ((and entry (slot-boundp obj (cdr entry)))
+                                                  (slot-value obj (cdr entry)))
+                                                 (t v))))))))
         (print-unreadable-object (obj stream :type t :identity nil)
           (format stream "~A ~A"
                   (or (sobject-type obj) "?")
@@ -296,6 +314,26 @@
    two threads (e.g. parallel bulk workers) that both first encounter a
    given sObject type at the same time.")
 
+(defun %define-relationship-readers (class-sym desc)
+  "Define <CLASS-SYM>-<RELATIONSHIP> for every parent and child relationship of
+   the describe result DESC, reading SOBJECT-RELATED: (user-contact user) is a
+   Contact object, (account-contacts account) a vector of them.  The names are
+   Salesforce's relationship names, the ones used in queries.  A closure per
+   reader, not a compiled function, so a large schema stays cheap to load."
+  (flet ((define (relationship)
+           (when (stringp relationship)
+             (let ((reader (intern (format nil "~A-~A" class-sym (string-upcase relationship))
+                                   *package*)))
+               ;; never replace a field's own accessor
+               (unless (and (fboundp reader)
+                            (typep (fdefinition reader) 'standard-generic-function))
+                 (setf (fdefinition reader)
+                       (lambda (object) (sobject-related object relationship))))))))
+    (loop for field across (gethash "fields" desc #())
+          do (define (gethash "relationshipName" field)))
+    (loop for child across (gethash "childRelationships" desc #())
+          do (define (gethash "relationshipName" child)))))
+
 (defun %eval-define-sobject-class (name desc)
   "Build and EVAL a DEFINE-SOBJECT-CLASS form for sObject NAME from its
    DESCRIBE-SOBJECT hash-table DESC.  Returns the generated class-name
@@ -315,6 +353,7 @@
                        collect (if temporal
                                    (list (intern (string-upcase sf-name)) sf-name :sf-type sf-type)
                                    (list (intern (string-upcase sf-name)) sf-name)))))
+    (%define-relationship-readers class-sym desc)
     class-sym))
 
 (defun %register-sobject-class (conn name &optional desc)
@@ -336,8 +375,9 @@
         (setf (gethash name *sobject-classes*) :failed)
         nil))))
 
-(defun hash->sobject (hash &optional hint-type conn)
-  "Convert a jzon hash-table HASH to a SOBJECT instance.
+(defun %hash->sobject-fields (hash hint-type conn)
+  "HASH as a SOBJECT with its field slots filled; see HASH->SOBJECT, which
+   also builds the related records.
 
    HINT-TYPE — optional Salesforce API name string.  If nil, the type is
                read from the 'attributes.type' key that Salesforce embeds
@@ -350,7 +390,7 @@
    Returns a typed subclass instance if one is registered in *SOBJECT-CLASSES*
    (loading it lazily via CONN if needed), or a plain SOBJECT with the full
    hash stored in SF-RAW otherwise."
-  (when (null hash) (return-from hash->sobject nil))
+  (when (null hash) (return-from %hash->sobject-fields nil))
   (let* ((attrs   (and (hash-table-p hash)
                        (gethash "attributes" hash)))
          (sf-type (or hint-type
@@ -381,6 +421,46 @@
           obj)
         ;; ── Generic fallback: unknown type, or no CONN to describe it ─
         (make-instance 'sobject :id id :type sf-type :raw hash))))
+
+(defun %hydrate-related (object hash conn)
+  "Turn the nested records in HASH into CLOS objects, kept in OBJECT's related
+   alist: a relationship record (it carries \"attributes\") becomes one object,
+   a child list ({\"records\": [...]}) a vector of them.  Other nested values,
+   such as a compound Address field, are left alone.  Each nested record is
+   built the same way as the top-level one, so it is a typed object when its
+   class is known, with its own related records."
+  (let ((related '()))
+    (maphash (lambda (key value)
+               (when (and (hash-table-p value) (not (equal key "attributes")))
+                 (cond ((nth-value 1 (gethash "records" value))
+                        (push (cons key (map 'vector (lambda (record) (hash->sobject record nil conn))
+                                             (gethash "records" value)))
+                              related))
+                       ((nth-value 1 (gethash "attributes" value))
+                        (push (cons key (hash->sobject value nil conn)) related)))))
+             hash)
+    (when related
+      (setf (%sobject-related object) (nreverse related)))
+    object))
+
+(defun hash->sobject (hash &optional hint-type conn)
+  "Convert a jzon hash-table HASH to a SOBJECT instance.
+
+   HINT-TYPE — optional Salesforce API name string.  If nil, the type is
+               read from the 'attributes.type' key that Salesforce embeds
+               in every query record.
+   CONN      — if the type has no registered class yet, used to lazily
+               DESCRIBE-SOBJECT and generate one on the spot (see
+               %REGISTER-SOBJECT-CLASS); if nil, falls back to generic
+               SOBJECT immediately.
+
+   Returns a typed subclass instance if one is registered in *SOBJECT-CLASSES*
+   (loading it lazily via CONN if needed), or a plain SOBJECT with the full
+   hash stored in SF-RAW otherwise.  Related records in HASH (parents, and
+   child lists from subqueries) become CLOS objects too: see SOBJECT-RELATED."
+  (let ((object (%hash->sobject-fields hash hint-type conn)))
+    (when object (%hydrate-related object hash conn))
+    object))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Conversion: SOBJECT → hash-table

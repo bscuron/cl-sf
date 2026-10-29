@@ -59,6 +59,7 @@
                cl-sf/objects:sobject-id
                cl-sf/objects:sobject-type
                cl-sf/objects:sobject-raw
+               cl-sf/objects:sobject-related
                cl-sf/objects:sobject-field-names
                cl-sf/objects:*sobject-classes*
                cl-sf/objects:hash->sobject
@@ -132,6 +133,7 @@
                sobject-id
                sobject-type
                sobject-raw
+               sobject-related
                sobject-field-names
                define-sobject-class
                load-sobject-classes

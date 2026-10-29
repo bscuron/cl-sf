@@ -52,7 +52,10 @@
                              :parents '(("OwnerId" "Owner" "Group" "User")))
         (gql-describe "GqlThing__c" :fields '("Id" "Name" "Type" "Score__c" "CreatedById"
                                               ("Seen__c" . "datetime") ("Born__c" . "date")
-                                              ("CreatedDate" . "datetime")))))
+                                              ("CreatedDate" . "datetime"))
+                                    :parents '(("OwnerId" "Owner" "User"))
+                                    :children '(("Notes__r" . "GqlNote__c")))
+        (gql-describe "GqlNote__c" :fields '("Id" "Name"))))
 
 (defun json (string) (com.inuoe.jzon:parse string))
 
@@ -689,3 +692,174 @@
     (false (slot-value o 'type))
     (setf (slot-value o 'type) "x")
     (is string= "x" (collide-probe-type o))))
+
+;;; ── Related records are CLOS objects ──────────────────────────────
+
+(define-test related
+  :parent cl-sf/tests
+  :description "Parent records and child lists as CLOS objects, with a reader per relationship.")
+
+(defun gql-class (name)
+  "Generate (in the isolated registries of WITH-GQL-ORG) the class for the fixture object NAME."
+  (cl-sf/objects::%eval-define-sobject-class
+   name (find name *gql-org* :key (lambda (d) (gethash "name" d)) :test #'string=)))
+
+(defun slot-by-field (object field)
+  (slot-value object (cdr (assoc field (gethash (class-name (class-of object)) cl-sf/objects:*sobject-slot-maps*)
+                                 :test #'equal))))
+
+(defparameter *soql-shaped-thing*
+  "{\"attributes\":{\"type\":\"GqlThing__c\"},\"Id\":\"a01\",\"Name\":\"T\",
+    \"Owner\":{\"attributes\":{\"type\":\"User\"},\"Id\":\"005\",\"Name\":\"Ada\"},
+    \"Notes__r\":{\"totalSize\":2,\"done\":true,\"records\":[
+        {\"attributes\":{\"type\":\"GqlNote__c\"},\"Name\":\"first\"},
+        {\"attributes\":{\"type\":\"GqlNote__c\"},\"Name\":\"second\"}]},
+    \"Parent\":null,
+    \"BillingAddress\":{\"city\":\"Oslo\"}}")
+
+(define-test related/parents-and-child-lists-are-clos-objects
+  :parent related
+  (with-gql-org (requests)
+    (gql-class "User") (gql-class "GqlNote__c") (gql-class "GqlThing__c")
+    (let* ((thing (cl-sf/objects:hash->sobject (json *soql-shaped-thing*)))
+           (owner (cl-sf/objects:sobject-related thing "Owner"))
+           (notes (cl-sf/objects:sobject-related thing "Notes__r")))
+      ;; the parent: one typed object with its own fields as slots
+      (true (typep owner (gethash "User" cl-sf/objects:*sobject-classes*)))
+      (is string= "User" (cl-sf/objects:sobject-type owner))
+      (is string= "005" (cl-sf/objects:sobject-id owner))
+      (is string= "Ada" (slot-by-field owner "Name"))
+      ;; the child list: a vector of typed objects
+      (true (simple-vector-p notes))
+      (is = 2 (length notes))
+      (true (every (lambda (n) (typep n (gethash "GqlNote__c" cl-sf/objects:*sobject-classes*))) notes))
+      (is equal '("first" "second") (map 'list (lambda (n) (slot-by-field n "Name")) notes))
+      ;; null, absent and compound values are not relationships
+      (false (cl-sf/objects:sobject-related thing "Parent"))
+      (false (cl-sf/objects:sobject-related thing "Nowhere"))
+      (false (cl-sf/objects:sobject-related thing "BillingAddress"))
+      (is equal '("Owner" "Notes__r") (mapcar #'car (cl-sf/objects:sobject-related thing)))
+      ;; lookup ignores case; the raw JSON is untouched
+      (is eq owner (cl-sf/objects:sobject-related thing "owner"))
+      (true (hash-table-p (gethash "Owner" (cl-sf/objects:sobject-raw thing)))))))
+
+(define-test related/each-relationship-has-a-reader-named-after-it
+  :parent related
+  (with-gql-org (requests)
+    (gql-class "User") (gql-class "GqlNote__c")
+    (let* ((class-name (gql-class "GqlThing__c"))
+           (thing (cl-sf/objects:hash->sobject (json *soql-shaped-thing*)))
+           (owner-reader (find-symbol "GQLTHING__C-OWNER" (symbol-package class-name)))
+           (notes-reader (find-symbol "GQLTHING__C-NOTES__R" (symbol-package class-name))))
+      (true (and owner-reader (fboundp owner-reader)))
+      (is string= "Ada" (slot-by-field (funcall owner-reader thing) "Name"))
+      (is = 2 (length (funcall notes-reader thing)))
+      ;; and a reader never replaces a field's own accessor
+      (let ((name-accessor (find-symbol "GQLTHING__C-NAME" (symbol-package class-name))))
+        (is string= "T" (funcall name-accessor thing))))))
+
+(define-test related/a-nested-record-of-an-unknown-class-is-a-generic-object
+  :parent related
+  (with-gql-org (requests)
+    (gql-class "GqlThing__c")                ; the User and GqlNote__c classes are not registered
+    (let* ((thing (cl-sf/objects:hash->sobject (json *soql-shaped-thing*)))
+           (owner (cl-sf/objects:sobject-related thing "Owner")))
+      (is eq 'cl-sf/objects:sobject (class-name (class-of owner)))
+      (is string= "User" (cl-sf/objects:sobject-type owner))
+      (is string= "Ada" (gethash "Name" (cl-sf/objects:sobject-raw owner))))))
+
+(define-test related/nested-records-nest
+  :parent related
+  (with-gql-org (requests)
+    (let* ((record (json "{\"attributes\":{\"type\":\"Contact\"},\"LastName\":\"G\",
+                           \"Account\":{\"attributes\":{\"type\":\"Account\"},\"Name\":\"Acme\",
+                                        \"Owner\":{\"attributes\":{\"type\":\"User\"},\"Name\":\"Ada\"}}}"))
+           (contact (cl-sf/objects:hash->sobject record))
+           (account (cl-sf/objects:sobject-related contact "Account"))
+           (owner   (cl-sf/objects:sobject-related account "Owner")))
+      (is string= "Acme" (gethash "Name" (cl-sf/objects:sobject-raw account)))
+      (is string= "Ada" (gethash "Name" (cl-sf/objects:sobject-raw owner))))))
+
+(define-test related/printing-shows-the-related-objects
+  :parent related
+  (with-gql-org (requests)
+    (gql-class "User") (gql-class "GqlNote__c") (gql-class "GqlThing__c")
+    (let ((text (princ-to-string (cl-sf/objects:hash->sobject (json *soql-shaped-thing*)))))
+      (true (search "Owner=User(" text))
+      (true (search "Name=Ada" text))
+      (true (search "Notes__r=[GqlNote__c(" text))
+      (false (search "NULL" text) "a JSON null prints as NIL, not NULL")
+      (true (search "Parent=NIL" text)))))
+
+(define-test related/the-query-in-the-report-is-correct-a-user-with-no-contact-is-just-nil
+  :parent related
+  (with-gql-org (requests)
+    (gql-class "GqlThing__c")
+    (let ((user (cl-sf/objects:hash->sobject
+                 (json "{\"attributes\":{\"type\":\"GqlThing__c\"},\"Name\":\"u\",\"Contact\":null}"))))
+      (false (cl-sf/objects:sobject-related user "Contact"))
+      (is equal "GqlThing__c(Name=u, Contact=NIL)" (princ-to-string user)))))
+
+(define-test related/gql-parents-and-children-are-typed-from-metadata
+  :parent related
+  (with-gql-org (requests :responses
+                          (list "{\"data\":{\"uiapi\":{\"query\":{\"GqlThing__c\":{\"edges\":[{\"node\":{\"Id\":\"a01\",\"Name\":{\"value\":\"T\"},\"Owner\":{\"Name\":{\"value\":\"Ada\"}},\"Notes__r\":{\"edges\":[{\"node\":{\"Name\":{\"value\":\"n1\"}}}]}}}]}}}}}"))
+    (gql-class "User") (gql-class "GqlNote__c")
+    (let* ((thing (aref (gethash "GqlThing__c"
+                                 (cl-sf/objects:gql
+                                   (GqlThing__c (edges (node Id (Name value) (Owner (Name value))
+                                                         (Notes__r (edges (node (Name value)))))))))
+                        0))
+           (owner (cl-sf/objects:sobject-related thing "Owner"))
+           (notes (cl-sf/objects:sobject-related thing "Notes__r")))
+      (is string= "User" (cl-sf/objects:sobject-type owner))
+      (true (typep owner (gethash "User" cl-sf/objects:*sobject-classes*)))
+      (is string= "Ada" (slot-by-field owner "Name"))
+      (is = 1 (length notes))
+      (is string= "GqlNote__c" (cl-sf/objects:sobject-type (aref notes 0))))))
+
+(define-test related/gql-polymorphic-parents-take-the-typename
+  :parent related
+  (with-gql-org (requests :responses
+                          (list "{\"data\":{\"uiapi\":{\"query\":{\"Lead\":{\"edges\":[{\"node\":{\"Id\":\"00Q\",\"Owner\":{\"__typename\":\"User\",\"Name\":{\"value\":\"Ada\"}}}}]}}}}}"))
+    (let* ((lead (aref (gethash "Lead"
+                                (cl-sf/objects:gql (Lead (edges (node Id (Owner (:on User (Name value)) __typename))))))
+                       0))
+           (owner (cl-sf/objects:sobject-related lead "Owner")))
+      (is string= "User" (cl-sf/objects:sobject-type owner)))))
+
+;;; ── Bulk: the two bugs the live run found ─────────────────────────
+
+(define-test bulk-column-names/upsert-on-id-includes-the-id-column
+  :parent bulk
+  ;; Id is never in a generated slot map, so upserting on Id sent no Id at all
+  (let ((cols (cl-sf/bulk::%bulk-column-names (list (make-widget :label "X")) :upsert "Id")))
+    (is string= "Id" (first cols))
+    (true (member "Label__c" cols :test #'equal)))
+  ;; an external id that is an ordinary field is still just one column
+  (let ((cols (cl-sf/bulk::%bulk-column-names (list (make-widget :label "X")) :upsert "Label__c")))
+    (is = 1 (count "Label__c" cols :test #'equal))))
+
+(define-test sobjects->csv/upsert-on-id-writes-the-ids
+  :parent bulk
+  (let ((existing (make-widget :label "A"))
+        (fresh    (make-widget :label "B")))
+    (setf (cl-sf/objects:sobject-id existing) "001EXISTING")
+    (let ((columns (cl-sf/bulk::%bulk-column-names (list existing fresh) :upsert "Id")))
+      (is string= (format nil "Id,Label__c,Amount__c,Active__c~%001EXISTING,A,,~%,B,,~%")
+          (csv-text (cl-sf/bulk::%sobjects->csv (list existing fresh) columns))))))
+
+(define-test build-bulk-result/a-failed-row-with-a-blank-result-id-is-matched-by-the-sent-id
+  :parent bulk
+  (let ((ghost (make-instance 'cl-sf/objects:sobject :id "006000000000000AAA" :type "Opportunity"))
+        (real  (make-instance 'cl-sf/objects:sobject :id "006REAL" :type "Opportunity")))
+    (with-stubbed-results
+        (:success (format nil "\"sf__Id\",\"sf__Created\",\"Id\"~%\"006REAL\",\"false\",\"006REAL\"~%")
+         :failed (format nil "\"sf__Id\",\"sf__Error\",\"Id\",\"Name\"~%\"\",\"INVALID_CROSS_REFERENCE_KEY:invalid cross reference id:--\",\"006000000000000AAA\",\"ghost\"~%")
+         :unprocessed "")
+      (let ((result (cl-sf/bulk::%build-bulk-result nil "J" (list real ghost) :update "Opportunity"
+                                                    (job-status "JobComplete" :processed 2 :failed 1))))
+        (is eq real (first (cl-sf/bulk:bulk-result-successful result)))
+        (is = 1 (length (cl-sf/bulk:bulk-result-failed result)))
+        (is eq ghost (car (first (cl-sf/bulk:bulk-result-failed result))))
+        (true (search "INVALID_CROSS_REFERENCE_KEY" (cdr (first (cl-sf/bulk:bulk-result-failed result)))))))))

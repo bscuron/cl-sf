@@ -322,11 +322,16 @@
                          all-fields)))
          (list* "Id" data-fields)))
       (:upsert
-       ;; Keep external-id-field even if it would normally be excluded
-       (remove-if (lambda (f)
-                    (and (member f *sf-read-only-fields* :test #'equal)
-                         (not (equal f external-id-field))))
-                  all-fields)))))
+       ;; The external-id field must be a column even if it would normally be
+       ;; excluded — and \"Id\" never is in the slot map, so upserting on Id
+       ;; used to send no Id at all and insert every row as new.
+       (let ((columns (remove-if (lambda (f)
+                                   (and (member f *sf-read-only-fields* :test #'equal)
+                                        (not (equal f external-id-field))))
+                                 all-fields)))
+         (if (or (null external-id-field) (member external-id-field columns :test #'equal))
+             columns
+             (cons external-id-field columns)))))))
 
 (defun %sobjects->csv (records fields)
   "Convert the list RECORDS to a Bulk 2.0 CSV with columns FIELDS, as an
@@ -640,7 +645,7 @@
    :unprocessed), concurrently when there is more than one.  Returns an
    alist (kind . rows); each row is a vector of that file's needed columns."
   (let* ((specs  '((:successful get-successful-results ("sf__Id" "sf__Created"))
-                   (:failed     get-failed-results     ("sf__Id" "sf__Error"))
+                   (:failed     get-failed-results     ("sf__Id" "sf__Error" "Id"))
                    (:unprocessed get-unprocessed-results ("Id"))))
          (wanted (remove-if-not (lambda (spec) (member (first spec) kinds)) specs))
          (fetch  (lambda (spec)
@@ -691,8 +696,11 @@
              (t (make-instance 'sobject :id sf-id :type sf-type))))
      ;; Failed rows: (nil-or-obj . error-string)
      :failed
+     ;; sf__Id is blank when the Id itself was bad (a nonexistent record); the
+     ;; row still echoes the Id we sent, in the original Id column
      (loop for row in failed-rows
-           for sf-id = (svref row 0)
+           for sf-id = (let ((result-id (svref row 0)))
+                         (if (and result-id (plusp (length result-id))) result-id (svref row 2)))
            for err   = (svref row 1)
            collect (cons (when (and id->obj sf-id (not (equal sf-id "")))
                            (gethash sf-id id->obj))

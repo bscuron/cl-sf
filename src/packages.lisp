@@ -108,6 +108,7 @@
    #:sobject-id
    #:sobject-type
    #:sobject-raw
+   #:sobject-related
    #:sobject-field-names
    ;; Class registry
    #:*sobject-classes*
