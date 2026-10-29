@@ -129,6 +129,15 @@
       "/" (cl-ppcre:regex-replace-all "\\+" b64 "-") "_")
      "")))
 
+(defun %pkce-verifier ()
+  "A fresh PKCE code verifier: 32 random bytes, base64url (43 characters)."
+  (%base64url-encode (ironclad:random-data 32)))
+
+(defun %pkce-challenge (verifier)
+  "The S256 code challenge for VERIFIER: base64url(SHA-256(verifier))."
+  (%base64url-encode
+   (ironclad:digest-sequence :sha256 (babel:string-to-octets verifier :encoding :ascii))))
+
 (defun %parse-token-response (body &key (api-version "v62.0")
                                         (login-url "https://login.salesforce.com")
                                         (client-id "PlatformCLI")
@@ -780,7 +789,8 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                                 (redirect-uri "http://localhost:1717/OauthRedirect")
                                 (instance     "https://login.salesforce.com")
                                 (scope        "full refresh_token offline_access")
-                                (api-version  "v62.0"))
+                                (api-version  "v62.0")
+                                code-challenge)
   "Begin the OAuth 2.0 Authorization Code (Web Server) flow.
 
    Constructs and returns (values authorization-url state) where STATE is
@@ -793,6 +803,10 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
    INSTANCE     — Login URL; use \"https://test.salesforce.com\" for sandboxes.
    SCOPE        — Space-separated OAuth scopes.
    API-VERSION  — Stored on the returned connection.
+   CODE-CHALLENGE — PKCE S256 challenge (see %PKCE-CHALLENGE); keep its
+                  verifier and pass it to CONNECT/WEB-SERVER-CALLBACK.
+                  Salesforce requires PKCE for many connected apps,
+                  including the CLI's PlatformCLI.
 
    Returns (values authorization-url state-string)."
   (declare (ignore api-version))  ; stored in callback
@@ -808,7 +822,10 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                                       ("client_id"     . ,client-id)
                                       ("redirect_uri"  . ,redirect-uri)
                                       ("scope"         . ,scope)
-                                      ("state"         . ,state))
+                                      ("state"         . ,state)
+                                      ,@(when code-challenge
+                                          `(("code_challenge"        . ,code-challenge)
+                                            ("code_challenge_method" . "S256"))))
                      for first = t then nil
                      unless first do (write-char #\& out)
                      do (format out "~A=~A"
@@ -817,7 +834,8 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
 
 (defun connect/web-server-callback (code &key client-id client-secret redirect-uri
                                               (instance    "https://login.salesforce.com")
-                                              (api-version "v62.0"))
+                                              (api-version "v62.0")
+                                              code-verifier)
   "Complete the Authorization Code flow after receiving the authorization CODE.
 
    CODE          — The 'code' query parameter from Salesforce's redirect.
@@ -825,6 +843,8 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
    CLIENT-SECRET — Connected App consumer secret.
    REDIRECT-URI  — Must match the original redirect URI exactly.
    INSTANCE      — Same login URL used in CONNECT/WEB-SERVER.
+   CODE-VERIFIER — The PKCE verifier whose challenge was sent to
+                   CONNECT/WEB-SERVER, if any.
 
    Returns a CONNECTION (includes a refresh token for future REFRESH-TOKEN calls)."
   (let ((params `(("grant_type"    . "authorization_code")
@@ -832,7 +852,9 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                   ("client_id"     . ,client-id)
                   ("redirect_uri"  . ,redirect-uri)
                   ,@(when client-secret
-                      `(("client_secret" . ,client-secret))))))
+                      `(("client_secret" . ,client-secret)))
+                  ,@(when code-verifier
+                      `(("code_verifier" . ,code-verifier))))))
     (%do-token-request (%token-endpoint instance) params
                        :api-version   api-version
                        :login-url     instance
@@ -1033,9 +1055,11 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
 
    The redirect's port must be free on localhost (the port in
    REDIRECT-URI, 1717 by default)."
-  (multiple-value-bind (url state)
+  (let* ((verifier (%pkce-verifier)))
+   (multiple-value-bind (url state)
       (connect/web-server :client-id client-id :redirect-uri redirect-uri
-                          :instance instance :api-version api-version)
+                          :instance instance :api-version api-version
+                          :code-challenge (%pkce-challenge verifier))
     (format t "~&Opening your browser to log in to ~A~%If it doesn't open, visit:~%  ~A~%"
             instance url)
     (%open-browser url)
@@ -1044,12 +1068,13 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
       (let ((conn (connect/web-server-callback code
                                                :client-id client-id :client-secret client-secret
                                                :redirect-uri redirect-uri
-                                               :instance instance :api-version api-version)))
+                                               :instance instance :api-version api-version
+                                               :code-verifier verifier)))
         (when save
           (let ((username (%persist-new-login conn :alias alias)))
             (when username
               (format t "~&Saved login for ~A~@[ (alias ~A)~] for the sf CLI.~%" username alias))))
-        conn))))
+        conn)))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; with-conn — the ergonomic entry point

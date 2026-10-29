@@ -487,3 +487,26 @@
       (cl-sf/auth::%persist-new-login (fresh-login) :alias "org"))
     (is string= "{not json"
         (uiop:read-file-string (merge-pathnames "alias.json" sfdx-dir)))))
+
+;;; ── PKCE ──────────────────────────────────────────────────────────
+
+(define-test pkce/challenge-matches-rfc-7636-example
+  :parent auth
+  ;; RFC 7636 appendix B
+  (is string= "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+      (cl-sf/auth::%pkce-challenge "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")))
+
+(define-test pkce/verifier-is-43-url-safe-characters-and-fresh
+  :parent auth
+  (let ((a (cl-sf/auth::%pkce-verifier)) (b (cl-sf/auth::%pkce-verifier)))
+    (is = 43 (length a))
+    (true (cl-ppcre:scan "^[A-Za-z0-9_-]+$" a))
+    (false (string= a b))))
+
+(define-test web-server/authorize-url-carries-the-pkce-challenge
+  :parent auth
+  (let ((url (cl-sf/auth:connect/web-server :client-id "PlatformCLI"
+                                            :code-challenge "CHAL")))
+    (true (search "code_challenge=CHAL" url))
+    (true (search "code_challenge_method=S256" url)))
+  (false (search "code_challenge" (cl-sf/auth:connect/web-server :client-id "x"))))
