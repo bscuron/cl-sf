@@ -10,6 +10,8 @@
 ;;;;
 ;;;; All flows return a CONNECTION struct.  API calls auto-refresh tokens on 401.
 
+#+sbcl (eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-bsd-sockets))
+
 (in-package #:cl-sf/auth)
 
 ;;; ──────────────────────────────────────────────────────────────────
@@ -838,8 +840,145 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
                        :client-secret client-secret)))
 
 ;;; ──────────────────────────────────────────────────────────────────
+;;; connect/browser — Authorization Code flow with a local callback
+;;; ──────────────────────────────────────────────────────────────────
+
+(defun %open-browser (url)
+  (uiop:launch-program
+   (cond ((uiop:os-windows-p) (list "rundll32" "url.dll,FileProtocolHandler" url))
+         ((uiop:os-macosx-p)  (list "open" url))
+         (t                   (list "xdg-open" url)))))
+
+(defun %query-params (target)
+  "\"/cb?code=a%3D&state=b\" -> ((\"code\" . \"a=\") (\"state\" . \"b\"))."
+  (let ((q (position #\? target)))
+    (when q
+      (loop for pair in (uiop:split-string (subseq target (1+ q)) :separator "&")
+            for eq = (position #\= pair)
+            when eq collect (cons (subseq pair 0 eq)
+                                  (quri:url-decode (subseq pair (1+ eq))))))))
+
+(defun %wait-for-oauth-redirect (port expected-state timeout)
+  "Listen on 127.0.0.1:PORT for Salesforce's redirect and return the
+   authorization code.  Requests without a code or error (a browser's
+   speculative preconnect, a favicon fetch) are ignored.  Polls a
+   non-blocking socket so TIMEOUT (seconds) is honoured on every platform
+   (a blocking accept can't be interrupted on Windows)."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+        (deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) port)
+    (sb-bsd-sockets:socket-listen listener 4)
+    (setf (sb-bsd-sockets:non-blocking-mode listener) t)
+    (unwind-protect
+         (loop
+           (when (> (get-internal-real-time) deadline)
+             (error 'sf-auth-error
+                    :message (format nil "No login completed in the browser within ~A seconds."
+                                     timeout)))
+           (let ((client (sb-bsd-sockets:socket-accept listener)))
+             (if (null client)
+                 (sleep 0.1)
+                 (let* ((stream (sb-bsd-sockets:socket-make-stream
+                                 client :input t :output t :buffering :full
+                                        :external-format :utf-8))
+                        (line   (and (sb-sys:wait-until-fd-usable
+                                      (sb-bsd-sockets:socket-file-descriptor client) :input 2)
+                                     (ignore-errors (read-line stream nil))))
+                        (params (and line (%query-params
+                                           (second (uiop:split-string line :separator " "))))))
+                   (when (or (assoc "code" params :test #'string=)
+                             (assoc "error" params :test #'string=))
+                     (format stream "HTTP/1.1 200 OK~C~%Content-Type: text/plain~C~%~
+                                     Connection: close~C~%~C~%Authenticated. You can close this tab.~%"
+                             #\Return #\Return #\Return #\Return)
+                     (finish-output stream)
+                     (close stream)
+                     (let ((error-text (or (cdr (assoc "error_description" params :test #'string=))
+                                           (cdr (assoc "error" params :test #'string=)))))
+                       (when error-text
+                         (error 'sf-auth-error
+                                :message (format nil "Salesforce refused the login: ~A" error-text)))
+                       (unless (equal expected-state (cdr (assoc "state" params :test #'string=)))
+                         (error 'sf-auth-error
+                                :message "OAuth state mismatch (possible CSRF); aborting."))
+                       (return (cdr (assoc "code" params :test #'string=)))))
+                   (ignore-errors (close stream))))))
+      (sb-bsd-sockets:socket-close listener))))
+
+(defun connect/browser (&key (instance "https://login.salesforce.com")
+                             (client-id "PlatformCLI")
+                             client-secret
+                             (redirect-uri "http://localhost:1717/OauthRedirect")
+                             (api-version "v62.0")
+                             (timeout 300))
+  "Authenticate interactively: open the system browser on Salesforce's
+   login page, wait on a local port for the redirect, and exchange the
+   code for tokens.  Returns a CONNECTION with a refresh token.
+
+   INSTANCE     — login URL: https://login.salesforce.com (default),
+                  https://test.salesforce.com for sandboxes, or your My
+                  Domain URL.
+   CLIENT-ID    — default is the Salesforce CLI's own public connected
+                  app, PlatformCLI, which needs no secret and already
+                  allows the default REDIRECT-URI (the one `sf org login
+                  web` uses).  Pass your own CLIENT-ID / CLIENT-SECRET /
+                  REDIRECT-URI to use a different connected app.
+   TIMEOUT      — seconds to wait for the browser before giving up.
+
+   The redirect's port must be free on localhost (the port in
+   REDIRECT-URI, 1717 by default)."
+  (multiple-value-bind (url state)
+      (connect/web-server :client-id client-id :redirect-uri redirect-uri
+                          :instance instance :api-version api-version)
+    (format t "~&Opening your browser to log in to ~A~%If it doesn't open, visit:~%  ~A~%"
+            instance url)
+    (%open-browser url)
+    (let ((code (%wait-for-oauth-redirect (or (quri:uri-port (quri:uri redirect-uri)) 80)
+                                          state timeout)))
+      (connect/web-server-callback code
+                                   :client-id client-id :client-secret client-secret
+                                   :redirect-uri redirect-uri
+                                   :instance instance :api-version api-version))))
+
+;;; ──────────────────────────────────────────────────────────────────
 ;;; with-conn — the ergonomic entry point
 ;;; ──────────────────────────────────────────────────────────────────
+
+(defvar *session-connections* (make-hash-table :test #'equal :synchronized t)
+  "(alias instance-url) -> CONNECTION, for the keyword form of WITH-CONN, so
+   a browser login happens once per Lisp session, not once per WITH-CONN.")
+
+(defun %same-instance-p (a b)
+  (flet ((norm (u) (string-right-trim "/" (string-downcase u))))
+    (string= (norm a) (norm b))))
+
+(defun %cached-connection (alias instance-url)
+  "ALIAS's connection from the sf/sfdx CLI cache, or NIL if the CLI has no
+   usable credentials for it.  Signals SF-AUTH-ERROR if the cached org is
+   a different INSTANCE-URL than requested — never silently pick the
+   wrong org."
+  (let ((conn (and alias
+                   (handler-case (connect/cached-credentials :username alias)
+                     (sf-auth-error () nil)))))
+    (when (and conn instance-url
+               (not (%same-instance-p instance-url (connection-instance-url conn))))
+      (error 'sf-auth-error
+             :message (format nil "~S is authorized for ~A in the sf CLI, but ~
+                                   :INSTANCE-URL is ~A."
+                              alias (connection-instance-url conn) instance-url)))
+    conn))
+
+(defun %with-conn-keys (&key alias instance-url)
+  "WITH-CONN's keyword form: the CLI-cached login for ALIAS if there is
+   one, else an interactive CONNECT/BROWSER login to INSTANCE-URL."
+  (unless (or alias instance-url)
+    (error 'sf-auth-error :message "WITH-CONN needs :ALIAS and/or :INSTANCE-URL."))
+  (let ((key (list alias (and instance-url (string-right-trim "/" (string-downcase instance-url))))))
+    (or (gethash key *session-connections*)
+        (setf (gethash key *session-connections*)
+              (or (%cached-connection alias instance-url)
+                  (connect/browser :instance (or instance-url "https://login.salesforce.com")))))))
 
 (defun %with-conn-resolve (org)
   "Used by WITH-CONN: a CONNECTION is used as-is; a string (an sf/sfdx CLI
@@ -848,23 +987,39 @@ Re-authenticate with CONNECT/JWT or CONNECT/SFDX-URL instead."))))
     (connection org)
     (string     (connect/cached-credentials :username org))))
 
-(defmacro with-conn (org &body body)
-  "Dynamically bind *CONNECTION* for the extent of BODY, so every cl-sf
-   call inside BODY can omit :CONN.
+(defmacro with-conn (&body forms)
+  "Dynamically bind *CONNECTION* for the extent of the body, so every cl-sf
+   call inside can omit :CONN.  Two forms:
 
-   ORG may be:
-     - a string — an sf/sfdx CLI alias or literal username, resolved via
-       CONNECT/CACHED-CREDENTIALS (the common case: reuse an existing login)
-     - an existing CONNECTION — e.g. from CONNECT/JWT or CONNECT/SFDX-URL,
-       used as-is (for flows CONNECT/CACHED-CREDENTIALS doesn't cover)
+   Keywords — (with-conn :alias \"myorg\" :instance-url \"https://...\" body...)
+     Uses the sf/sfdx CLI's cached login for :ALIAS if it has one.
+     Otherwise opens your browser to log in to :INSTANCE-URL (default
+     https://login.salesforce.com) via CONNECT/BROWSER.  The connection is
+     kept for the rest of the Lisp session, so the browser opens at most
+     once per alias/instance.  A cached alias that belongs to a different
+     instance than :INSTANCE-URL is an error.  (The login is held in
+     memory; it is not written to the CLI's files.)
+
+   Positional — (with-conn ORG body...)
+     ORG is a string (an sf/sfdx CLI alias or literal username, read from
+     the CLI cache) or an existing CONNECTION (e.g. from CONNECT/JWT).
 
    Examples:
+     (with-conn :alias \"org\" :instance-url \"https://myorg.my.salesforce.com\"
+       (select Id Name FROM Account LIMIT 5))
+
      (with-conn \"myorg\"
-       (map nil (lambda (acct) (format t \"~A~%\" (account-name acct)))
-            (select Id Name FROM Account)))
+       (select Id FROM Account))
 
      (with-conn (connect/jwt :client-id \"...\" :key-file #p\"server.key\"
                              :username \"me@example.com\")
        (select Id FROM Account))"
-  `(let ((*connection* (%with-conn-resolve ,org)))
-     ,@body))
+  (if (keywordp (first forms))
+      (let ((options '()))
+        (loop while (keywordp (first forms))
+              do (push (pop forms) options)
+                 (push (pop forms) options))
+        `(let ((*connection* (%with-conn-keys ,@(nreverse options))))
+           ,@forms))
+      `(let ((*connection* (%with-conn-resolve ,(first forms))))
+         ,@(rest forms))))

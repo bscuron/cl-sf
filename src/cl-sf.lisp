@@ -32,6 +32,7 @@
                cl-sf/auth:connect/jwt
                cl-sf/auth:connect/web-server
                cl-sf/auth:connect/web-server-callback
+               cl-sf/auth:connect/browser
                cl-sf/auth:connect/username-password
                cl-sf/auth:connect/sfdx-url
                cl-sf/auth:connect/cached-credentials
@@ -111,6 +112,7 @@
                connect/jwt
                connect/web-server
                connect/web-server-callback
+               connect/browser
                connect/username-password
                connect/sfdx-url
                connect/cached-credentials

@@ -281,3 +281,118 @@
           (fail (cl-sf/auth::%load-cached-org "nobody@example.com") 'cl-sf/auth:sf-auth-error
                 "No cached org anywhere → sf-auth-error"))
       (delete-temp-dir sf-dir) (delete-temp-dir sfdx-dir))))
+
+;;; ── WITH-CONN keyword form: CLI cache first, browser login otherwise ──
+
+(defmacro with-stubbed-logins ((cached browser log) &body body)
+  "CONNECT/CACHED-CREDENTIALS returns/signals per CACHED (a connection, or
+   NIL meaning no cached login); CONNECT/BROWSER returns BROWSER.  Both log
+   calls onto LOG.  Clears the per-session connection cache around BODY."
+  `(let ((saved-cached (fdefinition 'cl-sf/auth:connect/cached-credentials))
+         (saved-browser (fdefinition 'cl-sf/auth:connect/browser)))
+     (clrhash cl-sf/auth::*session-connections*)
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'cl-sf/auth:connect/cached-credentials)
+                  (lambda (&key username &allow-other-keys)
+                    (push (list :cached username) ,log)
+                    (or ,cached
+                        (error 'cl-sf/auth:sf-auth-error :message "no cached credentials")))
+                  (fdefinition 'cl-sf/auth:connect/browser)
+                  (lambda (&key instance &allow-other-keys)
+                    (push (list :browser instance) ,log)
+                    ,browser))
+            ,@body)
+       (setf (fdefinition 'cl-sf/auth:connect/cached-credentials) saved-cached
+             (fdefinition 'cl-sf/auth:connect/browser) saved-browser)
+       (clrhash cl-sf/auth::*session-connections*))))
+
+(define-test with-conn/keywords-use-cli-cache-first
+  :parent auth
+  (let* ((log '())
+         (cached (cl-sf/auth:make-connection :instance-url "https://org.my.salesforce.com/")))
+    (with-stubbed-logins (cached nil log)
+      (cl-sf/auth:with-conn :alias "org" :instance-url "https://ORG.my.salesforce.com"
+        (is eq cached cl-sf/auth:*connection*))
+      (is equal '((:cached "org")) log))))
+
+(define-test with-conn/keywords-fall-back-to-browser-once-per-session
+  :parent auth
+  (let* ((log '())
+         (fresh (cl-sf/auth:make-connection :instance-url "https://org.my.salesforce.com")))
+    (with-stubbed-logins (nil fresh log)
+      (dotimes (i 2)
+        (cl-sf/auth:with-conn :alias "org" :instance-url "https://org.my.salesforce.com"
+          (is eq fresh cl-sf/auth:*connection*)))
+      (is equal '((:browser "https://org.my.salesforce.com") (:cached "org"))
+          log))))
+
+(define-test with-conn/keywords-instance-url-only-skips-the-cache
+  :parent auth
+  (let* ((log '()) (fresh (cl-sf/auth:make-connection)))
+    (with-stubbed-logins (nil fresh log)
+      (cl-sf/auth:with-conn :instance-url "https://test.salesforce.com"
+        (is eq fresh cl-sf/auth:*connection*))
+      (is equal '((:browser "https://test.salesforce.com")) log))))
+
+(define-test with-conn/cached-alias-for-a-different-instance-is-an-error
+  :parent auth
+  (let* ((log '())
+         (cached (cl-sf/auth:make-connection :instance-url "https://prod.my.salesforce.com")))
+    (with-stubbed-logins (cached nil log)
+      (fail (cl-sf/auth:with-conn :alias "org" :instance-url "https://dev.my.salesforce.com" 1)
+            'cl-sf/auth:sf-auth-error)
+      (is equal '((:cached "org")) log))))
+
+(define-test with-conn/keywords-need-an-alias-or-instance
+  :parent auth
+  (fail (cl-sf/auth::%with-conn-keys) 'cl-sf/auth:sf-auth-error))
+
+(define-test with-conn/positional-form-still-works
+  :parent auth
+  (let ((conn (cl-sf/auth:make-connection)))
+    (cl-sf/auth:with-conn conn
+      (is eq conn cl-sf/auth:*connection*))))
+
+(define-test oauth-redirect/query-params-are-decoded
+  :parent auth
+  (is equal '(("code" . "aPr==") ("state" . "abc"))
+      (cl-sf/auth::%query-params "/OauthRedirect?code=aPr%3D%3D&state=abc")))
+
+(defun http-get-localhost (port path)
+  "Open a connection to localhost:PORT; send GET PATH when PATH is non-NIL.
+   Returns the stream (so the caller can read the response)."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-connect s #(127 0 0 1) port)
+    (let ((st (sb-bsd-sockets:socket-make-stream s :input t :output t :buffering :full)))
+      (when path
+        (format st "GET ~A HTTP/1.1~C~%Host: localhost~C~%~C~%" path #\Return #\Return #\Return)
+        (finish-output st))
+      st)))
+
+(defun run-redirect-listener (port state timeout)
+  (sb-thread:make-thread
+   (lambda () (handler-case (cl-sf/auth::%wait-for-oauth-redirect port state timeout)
+                (cl-sf/auth:sf-auth-error (e) e)))))
+
+(define-test oauth-redirect/returns-the-code-ignoring-stray-connections
+  :parent auth
+  (let ((listener (run-redirect-listener 17174 "st8" 20)))
+    (sleep 0.5)
+    (http-get-localhost 17174 nil)                   ; idle preconnect
+    (http-get-localhost 17174 "/favicon.ico")        ; no code -> ignored
+    (let ((response (http-get-localhost 17174 "/OauthRedirect?code=aPr%3D%3D&state=st8")))
+      (true (search "200 OK" (read-line response nil))))
+    (is equal "aPr==" (sb-thread:join-thread listener :timeout 15))))
+
+(define-test oauth-redirect/rejects-a-wrong-state
+  :parent auth
+  (let ((listener (run-redirect-listener 17175 "st8" 20)))
+    (sleep 0.5)
+    (http-get-localhost 17175 "/OauthRedirect?code=x&state=evil")
+    (true (typep (sb-thread:join-thread listener :timeout 15) 'cl-sf/auth:sf-auth-error))))
+
+(define-test oauth-redirect/times-out
+  :parent auth
+  (true (typep (sb-thread:join-thread (run-redirect-listener 17176 "st8" 1) :timeout 15)
+               'cl-sf/auth:sf-auth-error)))

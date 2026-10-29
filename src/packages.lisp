@@ -62,6 +62,7 @@
    #:token-valid-p
    ;; Dynamic connection ergonomics
    #:*connection*
+   #:connect/browser
    #:with-conn))
 
 ;;; ──────────────────────────────────────────────────────────────────
