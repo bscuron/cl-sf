@@ -152,6 +152,11 @@
    ;; Conditions
    #:bulk-error
    #:bulk-error-message
+   #:bulk-match-error
+   #:bulk-match-error-result
+   #:bulk-match-error-unmatched
+   #:bulk-match-error-job-id
+   #:use-result
    #:bulk-timeout-error
    #:bulk-timeout-error-job-id
    #:bulk-timeout-error-timeout

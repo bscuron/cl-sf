@@ -56,6 +56,20 @@
                      (bulk-timeout-error-job-id c)
                      (bulk-timeout-error-timeout c)))))
 
+(define-condition bulk-match-error (bulk-error)
+  ((result    :initarg :result :reader bulk-match-error-result
+              :documentation "The BULK-RESULT, with new objects standing in for the unmatched rows.")
+   (unmatched :initarg :unmatched :reader bulk-match-error-unmatched :initform 0)
+   (job-id    :initarg :job-id :reader bulk-match-error-job-id :initform nil))
+  (:report (lambda (c s)
+             (format s "cl-sf bulk error: ~A" (bulk-error-message c))))
+  (:documentation
+   "The job succeeded, but some result rows could not be matched to the objects
+    that were sent.  The records exist in Salesforce: BULK-MATCH-ERROR-RESULT
+    is the full result (objects that did match carry their Ids; each
+    unmatched row is a new object holding its Id), and the USE-RESULT restart
+    returns it."))
+
 (define-condition bulk-job-failed-error (bulk-error)
   ((job-id :initarg :job-id :reader bulk-job-failed-error-job-id)
    (status :initarg :status :reader bulk-job-failed-error-status))
@@ -695,8 +709,16 @@
           (concatenate 'string sign whole (if (string= fraction "") "" ".") fraction))
         cell)))
 
+(defun %relax-cell (cell)
+  "CELL as it would compare after Salesforce's tidying: surrounding whitespace
+   and carriage returns dropped, plain numbers written canonically."
+  (if cell
+      (%canonical-number (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                      (remove #\Return cell)))
+      ""))
+
 (defun %relaxed-row-key (cells)
-  (%row-key (mapcar #'%canonical-number cells)))
+  (%row-key (mapcar #'%relax-cell cells)))
 
 (defun %match-by-content (inputs upload columns rows complete-p)
   "Match the result ROWS (each a list of cells, in the order of COLUMNS) to the
@@ -704,8 +726,9 @@
    CSV that was sent.  Returns a vector parallel to ROWS holding the matched
    object, or NIL.  Three passes, each only over what the last left:
      1. the cells are identical (identical rows pair off in order);
-     2. identical once plain numbers are written canonically, because
-        Salesforce echoes 1.50 as 1.5;
+     2. identical once surrounding whitespace, carriage returns and number
+        formatting are ignored (Salesforce echoes 1.50 as 1.5, and trims or
+        pads text);
      3. by elimination: one input and one row left, and COMPLETE-P (every
         input has a result row), so they can only belong together."
   (let* ((uploaded (coerce (%csv-select upload columns) 'simple-vector))
@@ -794,6 +817,7 @@
                                 (loop for row in f-rows for o in f-objs unless o collect (cells-of row f-names)))))
              ;; the records already exist in Salesforce: if matching them up goes
              ;; wrong for any reason, report fresh objects rather than lose the result
+             (match-failure nil)
              (found   (if pending
                           (handler-case
                               (values (%match-by-content inputs upload columns pending
@@ -801,12 +825,13 @@
                                                               (= (+ (length s-rows) (length f-rows))
                                                                  (length inputs)))))
                             (error (e)
-                              (warn "cl-sf: could not match the bulk results to the objects sent (~A); ~
-                                     returning new objects carrying the Ids" e)
+                              (setf match-failure e)
                               (make-array (length pending) :initial-element nil)))
                           #()))
+             (unmatched (count nil found))
              (cursor  0))
         (flet ((next-found () (prog1 (svref found cursor) (incf cursor))))
+         (let ((result
           (make-bulk-result
            :successful
            (loop for row in s-rows
@@ -828,7 +853,53 @@
            :unprocessed
            (loop for row in unproc-rows
                  collect (make-instance 'sobject :id (svref row 0) :type sf-type))
-           :job-id job-id))))))
+           :job-id job-id)))
+           (if (zerop unmatched)
+               result
+               ;; the records exist in Salesforce, so the result is not lost with the error
+               (restart-case
+                   (error 'bulk-match-error
+                          :result result :unmatched unmatched :job-id job-id
+                          :message (format nil "~D of ~D result row~:P could not be matched to the ~
+                                                objects that were sent~@[ (matching failed: ~A)~] (job ~A). ~
+                                                The records exist in Salesforce; BULK-MATCH-ERROR-RESULT ~
+                                                holds them, and the USE-RESULT restart returns that result."
+                                           unmatched (length found) match-failure job-id))
+                 (use-result ()
+                   :report "Return the result, with a new object for each unmatched row."
+                   result)))))))))
+
+(defun %refresh-objects (conn sf-type columns objects)
+  "Bring OBJECTS — just written by a Bulk job — in line with what Salesforce
+   stored: read them back by Id (the COLUMNS that were written, 300 Ids a
+   query, the queries in parallel) and update their slots and raw record.
+   Salesforce trims text, rewrites numbers and runs triggers, so this is the
+   accurate data.  A read that fails is a warning: the write itself worked."
+  (let* ((objects (remove-if-not #'sobject-id objects))
+         (by-id   (make-hash-table :test #'equal :size (max 7 (length objects))))
+         (fields  (format nil "~{~A~^, ~}" (remove-duplicates (cons "Id" columns)
+                                                              :test #'string= :from-end t)))
+         (ids     (mapcar #'sobject-id objects))
+         (chunks  (loop while ids collect (loop repeat 300 while ids collect (pop ids)))))
+    (dolist (o objects) (setf (gethash (sobject-id o) by-id) o))
+    (flet ((fetch (chunk)
+             (handler-case
+                 (coerce (cl-sf/api::%query-records
+                          conn (format nil "SELECT ~A FROM ~A WHERE Id IN (~{~A~^,~})"
+                                       fields sf-type
+                                       (mapcar #'cl-sf/objects::%soql-literal-string chunk)))
+                         'list)
+               (error (e) e))))
+      (dolist (rows (if (cdr chunks)
+                        (progn (cl-sf/auth::%ensure-lparallel-kernel)
+                               (lparallel:pmapcar #'fetch chunks))
+                        (mapcar #'fetch chunks)))
+        (if (typep rows 'error)
+            (warn "cl-sf: wrote the records, but could not read them back to refresh the objects (~A)" rows)
+            (dolist (hash rows)
+              (let ((object (gethash (gethash "Id" hash) by-id)))
+                (when object (cl-sf/objects::%refresh-sobject object hash)))))))
+    objects))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; High-level CLOS-first operations
@@ -849,15 +920,19 @@ DEFINE-SOBJECT-CLASS)."))
 
 (defun %run-bulk-operation (conn operation records
                             &key external-id-field
-                                 (interval 5) (timeout 3600))
+                                 (interval 5) (timeout 3600) (refresh t))
   "Orchestrate a complete Bulk 2.0 ingest operation.
    1. Determine columns; start creating the job (a LPARALLEL:FUTURE) while
       the records are serialized to CSV — the two are independent.
    2. Upload the CSV → signal UploadComplete.
    3. %POLL-JOB until the job finishes (backing off from 0.5 s to INTERVAL).
    4. On job failure: signal BULK-JOB-FAILED-ERROR.
-   5. Download the needed result files in parallel; return a BULK-RESULT.
-   On any error: attempt to abort the job before re-signaling."
+   5. Download the needed result files in parallel and match them to the
+      objects sent; return a BULK-RESULT (BULK-MATCH-ERROR if rows cannot be
+      matched).
+   6. Unless REFRESH is NIL, re-read the written records and update the
+      objects to what Salesforce stored (inserts, updates and upserts).
+   On an error before the job completes: attempt to abort the job."
   (let* ((sf-type  (%infer-sobject-type records))
          (columns  (%bulk-column-names records operation
                                        (when (eq operation :upsert)
@@ -881,50 +956,66 @@ DEFINE-SOBJECT-CLASS)."))
                        (error e))))
          (job      (lparallel:force job-future))
          (job-id   (gethash "id" job)))
-    (handler-case
-        (progn
-          ;; 2. Upload CSV data
-          ;; NOTE: ">= 10 chars" — see UPLOAD-JOB-DATA for why plain
-          ;; "text/csv" crashes dexador's WinHTTP backend on Windows.
-          (api-request :put
-                       (%bulk-path (format nil "/~A/batches" job-id))
-                       :body         csv
-                       :content-type "text/csv; charset=UTF-8"
-                       :conn         conn)
-          ;; Signal upload complete → Salesforce begins processing
-          (close-bulk-job job-id :conn conn)
-          ;; 3. Wait for the job to finish
-          (let* ((final-status (%poll-job conn job-id
-                                          :interval interval
-                                          :timeout  timeout))
-                 (final-state  (gethash "state" final-status "")))
-            ;; 4. Check for job-level failure
-            (when (member final-state '("Failed" "Aborted") :test #'equal)
-              (error 'bulk-job-failed-error
-                     :job-id  job-id
-                     :status  final-status
-                     :message (format nil "Bulk job ~A entered state ~A"
-                                      job-id final-state)))
-            ;; 5. Fetch + correlate results
-            (%build-bulk-result conn job-id records operation sf-type
-                                :status final-status :upload csv :columns columns)))
-      ;; On any error, attempt a clean abort so the job doesn't linger
-      (error (e)
-        (handler-case (abort-bulk-job job-id :conn conn) (error ()))
-        (error e)))))
+    (let ((final-status
+            (handler-case
+                (progn
+                  ;; 2. Upload CSV data
+                  ;; NOTE: ">= 10 chars" — see UPLOAD-JOB-DATA for why plain
+                  ;; "text/csv" crashes dexador's WinHTTP backend on Windows.
+                  (api-request :put
+                               (%bulk-path (format nil "/~A/batches" job-id))
+                               :body         csv
+                               :content-type "text/csv; charset=UTF-8"
+                               :conn         conn)
+                  ;; Signal upload complete → Salesforce begins processing
+                  (close-bulk-job job-id :conn conn)
+                  ;; 3. Wait for the job to finish
+                  (let* ((final-status (%poll-job conn job-id
+                                                  :interval interval
+                                                  :timeout  timeout))
+                         (final-state  (gethash "state" final-status "")))
+                    ;; 4. Check for job-level failure
+                    (when (member final-state '("Failed" "Aborted") :test #'equal)
+                      (error 'bulk-job-failed-error
+                             :job-id  job-id
+                             :status  final-status
+                             :message (format nil "Bulk job ~A entered state ~A"
+                                              job-id final-state)))
+                    final-status))
+              ;; On any error, attempt a clean abort so the job doesn't linger
+              (error (e)
+                (handler-case (abort-bulk-job job-id :conn conn) (error ()))
+                (error e)))))
+      ;; 5. Fetch + correlate results.  Outside the handler above: the job is
+      ;; done, and a BULK-MATCH-ERROR must keep its USE-RESULT restart.
+      (let ((result (%build-bulk-result conn job-id records operation sf-type
+                                        :status final-status :upload csv :columns columns)))
+        ;; 6. What Salesforce stored is the accurate data
+        (when (and refresh (member operation '(:insert :update :upsert)))
+          (let ((sent (make-hash-table :test #'eq :size (max 7 (length records)))))
+            (dolist (record records) (setf (gethash record sent) t))
+            (%refresh-objects conn sf-type columns
+                              (remove-if-not (lambda (object) (gethash object sent))
+                                             (bulk-result-successful result)))))
+        result))))
 
 ;;; ── Public API ───────────────────────────────────────────────────
 
-(defun bulk-insert (objects &key (conn *connection*) (interval 5) (timeout 3600))
+(defun bulk-insert (objects &key (conn *connection*) (interval 5) (timeout 3600) (refresh t))
   "Insert OBJECTS (a list of SOBJECT instances) via Salesforce Bulk 2.0.
    The Salesforce API type is inferred from the first element.
    All objects should be the same type.
 
    Returns a BULK-RESULT:
      - SUCCESSFUL  — the objects you passed, each now holding its Salesforce Id
-                     (matched by content; see %BUILD-BULK-RESULT)
+                     (matched by content; see %BUILD-BULK-RESULT) and, unless
+                     REFRESH is NIL, the values Salesforce actually stored
+                     (it is read back once the job finishes)
      - FAILED      — (object . error-string) conses for each failed record
      - UNPROCESSED — SOBJECT instances not yet processed
+
+   If result rows cannot be matched to the objects, BULK-MATCH-ERROR is
+   signalled; the records exist, and its result and USE-RESTART keep them.
 
    For automatic REST/Bulk routing see DATABASE-INSERT.
 
@@ -933,9 +1024,9 @@ DEFINE-SOBJECT-CLASS)."))
        (mapc (lambda (s) (format t \"Created: ~A~%\" (sobject-id s)))
              (bulk-result-successful result)))"
   (%run-bulk-operation conn :insert objects
-                       :interval interval :timeout timeout))
+                       :interval interval :timeout timeout :refresh refresh))
 
-(defun bulk-update (objects &key (conn *connection*) (interval 5) (timeout 3600))
+(defun bulk-update (objects &key (conn *connection*) (interval 5) (timeout 3600) (refresh t))
   "Update OBJECTS via Bulk 2.0.  All objects must have SOBJECT-ID set.
    Returns a BULK-RESULT where SUCCESSFUL contains the original input
    objects (matched back by Id).
@@ -944,17 +1035,17 @@ DEFINE-SOBJECT-CLASS)."))
      (dolist (acct accounts) (setf (account-phone acct) \"555-0000\"))
      (bulk-update accounts)"
   (%run-bulk-operation conn :update objects
-                       :interval interval :timeout timeout))
+                       :interval interval :timeout timeout :refresh refresh))
 
 (defun bulk-upsert (objects external-id-field
-                    &key (conn *connection*) (interval 5) (timeout 3600))
+                    &key (conn *connection*) (interval 5) (timeout 3600) (refresh t))
   "Upsert OBJECTS via Bulk 2.0 using EXTERNAL-ID-FIELD as the match key.
    EXTERNAL-ID-FIELD is the Salesforce API field name string
    (e.g. \"My_External_Id__c\").
    Returns a BULK-RESULT."
   (%run-bulk-operation conn :upsert objects
                        :external-id-field external-id-field
-                       :interval interval :timeout timeout))
+                       :interval interval :timeout timeout :refresh refresh))
 
 (defun bulk-delete (objects &key (conn *connection*) (interval 5) (timeout 3600))
   "Delete OBJECTS via Bulk 2.0.  Only SOBJECT-ID is used from each object.

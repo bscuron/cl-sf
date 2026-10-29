@@ -83,6 +83,11 @@
   ;; ── Bulk ────────────────────────────────────────────────────────
   (cl:import '(cl-sf/bulk:bulk-error
                cl-sf/bulk:bulk-error-message
+               cl-sf/bulk:bulk-match-error
+               cl-sf/bulk:bulk-match-error-result
+               cl-sf/bulk:bulk-match-error-unmatched
+               cl-sf/bulk:bulk-match-error-job-id
+               cl-sf/bulk:use-result
                cl-sf/bulk:bulk-timeout-error
                cl-sf/bulk:bulk-job-failed-error
                cl-sf/bulk:bulk-result
@@ -112,6 +117,11 @@
                sf-dml-error-failures
                sf-dml-error-succeeded
                bulk-error
+               bulk-match-error
+               bulk-match-error-result
+               bulk-match-error-unmatched
+               bulk-match-error-job-id
+               use-result
                bulk-timeout-error
                bulk-job-failed-error
                connection

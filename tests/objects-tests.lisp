@@ -440,10 +440,10 @@
                               ,log)
                     objects)
                   (fdefinition 'cl-sf/bulk:bulk-insert)
-                  (lambda (objs &key conn) (declare (ignore conn))
+                  (lambda (objs &key conn &allow-other-keys) (declare (ignore conn))
                     (log-push (list :bulk :insert (length objs)) ,log) :bulk-result)
                   (fdefinition 'cl-sf/bulk:bulk-delete)
-                  (lambda (objs &key conn) (declare (ignore conn))
+                  (lambda (objs &key conn &allow-other-keys) (declare (ignore conn))
                     (log-push (list :bulk :delete (length objs)) ,log) :bulk-result))
             ,@body)
        (loop for name in '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
