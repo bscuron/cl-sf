@@ -1058,17 +1058,112 @@ Did you mean DATABASE-INSERT?"))
 ;;; DML — Apex's Database.insert / update / upsert / delete
 ;;;
 ;;; Each takes one SOBJECT or a sequence of SOBJECTs, all of one sObject
-;;; type (mixing types signals SF-API-ERROR).  A single object, or a
-;;; sequence of at most BULK-THRESHOLD, goes through the REST API one
-;;; record at a time; a longer sequence is routed to Bulk 2.0.  An object
-;;; with no SOBJECT-TYPE gets it from its Id's key prefix.
+;;; type (mixing types signals SF-API-ERROR).  Routing:
+;;;   one object                       single-record REST call
+;;;   sequence of <= BULK-THRESHOLD    sObject Collections API: 200 records
+;;;                                    per request, requests sent in parallel
+;;;   longer sequence                  Bulk 2.0
+;;; An object with no SOBJECT-TYPE gets it from its Id's key prefix.
 ;;; ──────────────────────────────────────────────────────────────────
 
-(defun %dml (objects conn bulk-threshold one-fn bulk-fn)
-  "Dispatch a DML call: ONE-FN (lambda (object)) per record over REST, or
-   BULK-FN (lambda (list)) when OBJECTS is a sequence longer than
-   BULK-THRESHOLD.  Returns ONE-FN's result for a single object, BULK-FN's
-   result (a BULK-RESULT) for bulk, else OBJECTS."
+(defun %chunks (list size)
+  "Split LIST into consecutive sublists of at most SIZE elements."
+  (loop while list
+        collect (loop repeat size while list collect (pop list))))
+
+(defun %collection-record (object type &key id)
+  "OBJECT as one Collections request record: its fields plus attributes.type
+   (and, for updates, Id)."
+  (let ((record (sobject->hash-table object))
+        (attributes (make-hash-table :test #'equal)))
+    (setf (gethash "type" attributes) type
+          (gethash "attributes" record) attributes)
+    (when id (setf (gethash "Id" record) id))
+    record))
+
+(defun %collection-error-text (result)
+  "One line describing a failed Collections result's errors."
+  (let ((errors (gethash "errors" result)))
+    (if (and errors (plusp (length errors)))
+        (format nil "~{~A~^; ~}"
+                (map 'list (lambda (e)
+                             (format nil "~A: ~A~@[ (~{~A~^, ~})~]"
+                                     (gethash "statusCode" e) (gethash "message" e)
+                                     (let ((f (gethash "fields" e)))
+                                       (and f (plusp (length f)) (coerce f 'list)))))
+                     errors))
+        "unknown error")))
+
+(defun %collection-request (operation chunk type external-id-field conn)
+  "Send one chunk (<= 200 objects) through the Collections API.  Returns the
+   vector of per-record results."
+  (ecase operation
+    (:insert (cl-sf/api::%collection-create
+              conn (mapcar (lambda (o) (%collection-record o type)) chunk)))
+    (:update (cl-sf/api::%collection-update
+              conn (mapcar (lambda (o) (%collection-record o type :id (sobject-id o))) chunk)))
+    (:upsert (cl-sf/api::%collection-upsert
+              conn type external-id-field
+              (mapcar (lambda (o) (%collection-record o type)) chunk)))
+    (:delete (cl-sf/api::%collection-delete conn (mapcar #'sobject-id chunk)))))
+
+(defun %collection-dml (operation objects conn &key external-id-field)
+  "Run OPERATION (:insert :update :upsert :delete) over OBJECTS, a non-empty
+   list of one sObject type, via the sObject Collections API: chunks of up
+   to 200, sent concurrently when there is more than one chunk (only the
+   HTTP calls run on workers; objects are touched afterwards, here).
+   Inserted/upserted objects get their Ids.  Every chunk is attempted;
+   afterwards, if any record failed, signals SF-DML-ERROR (records that
+   succeeded stay committed)."
+  (when (member operation '(:update :delete))
+    (let ((missing (find-if-not #'sobject-id objects)))
+      (when missing
+        (error 'sf-api-error
+               :message (format nil "SOBJECT instance has no Id — cannot ~(~A~) a record without an Id."
+                                operation)))))
+  (let* ((type    (sobject-type (first objects)))
+         (chunks  (%chunks objects cl-sf/api::*collection-max-records*))
+         ;; a chunk whose request itself fails (HTTP error) counts as all of
+         ;; its records failing; the other chunks are still carried through
+         (request (lambda (chunk)
+                    (handler-case
+                        (%collection-request operation chunk type external-id-field conn)
+                      (error (e) e))))
+         (results (if (cdr chunks)
+                      (progn (cl-sf/auth::%ensure-lparallel-kernel)
+                             (lparallel:pmapcar request chunks))
+                      (list (funcall request (first chunks)))))
+         (failures '())
+         (succeeded 0))
+    (loop for chunk in chunks
+          for result-vector in results
+          do (if (typep result-vector 'error)
+                 (dolist (object chunk)
+                   (push (cons object (princ-to-string result-vector)) failures))
+                 (loop for object in chunk
+                       for result across result-vector
+                       do (cond ((gethash "success" result)
+                                 (incf succeeded)
+                                 (when (and (member operation '(:insert :upsert))
+                                            (gethash "id" result))
+                                   (setf (sobject-id object) (gethash "id" result))))
+                                (t (push (cons object (%collection-error-text result))
+                                         failures))))))
+    (when failures
+      (setf failures (nreverse failures))
+      (error 'sf-dml-error
+             :failures failures
+             :succeeded succeeded
+             :message (format nil "~D of ~D record~:P failed to ~(~A~) (~D succeeded). First error: ~A"
+                              (length failures) (length objects) operation succeeded
+                              (cdr (first failures)))))
+    objects))
+
+(defun %dml (objects conn bulk-threshold one-fn collection-fn bulk-fn)
+  "Dispatch a DML call: ONE-FN for a single object; for a sequence,
+   BULK-FN (lambda (list)) when it is longer than BULK-THRESHOLD, else
+   COLLECTION-FN (lambda (list)).  Returns ONE-FN's result for a single
+   object, BULK-FN's BULK-RESULT for bulk, else OBJECTS."
   (cond ((typep objects 'sobject)
          (%resolve-type objects conn)
          (funcall one-fn objects))
@@ -1077,39 +1172,47 @@ Did you mean DATABASE-INSERT?"))
          (%resolve-type objects conn))        ; signals the SF-API-ERROR
         (t (let ((list (coerce objects 'list)))
              (%require-one-type list conn)
-             (if (and bulk-threshold (> (length list) bulk-threshold))
-                 (funcall bulk-fn list)
-                 (progn (mapc one-fn list)
-                        objects))))))
+             (cond ((null list) objects)
+                   ((and bulk-threshold (> (length list) bulk-threshold))
+                    (funcall bulk-fn list))
+                   (t (funcall collection-fn list)
+                      objects))))))
 
 (defun database-insert (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Insert OBJECTS (one SOBJECT or a sequence of them, all one type) into
    Salesforce.  Each object's SOBJECT-ID is set from the response.
 
-   A sequence longer than BULK-THRESHOLD (default *BULK-THRESHOLD*, 200) is
-   sent through Bulk 2.0 and a BULK-RESULT is returned; otherwise records
-   are inserted over REST and OBJECTS is returned.  BULK-THRESHOLD 0 always
-   uses Bulk; NIL never does.
+   A sequence of at most BULK-THRESHOLD (default *BULK-THRESHOLD*, 200) goes
+   through the sObject Collections API — 200 records per request, several
+   requests in parallel — and OBJECTS is returned.  A longer sequence is
+   sent through Bulk 2.0 and a BULK-RESULT is returned.  BULK-THRESHOLD 0
+   always uses Bulk; NIL never does.
+
+   If any record is rejected, every other record is still processed, then
+   SF-DML-ERROR is signalled; its SF-DML-ERROR-FAILURES lists each failed
+   object with the reason.
 
    Example:
      (database-insert (make-instance 'account :name \"Acme\"))
      (database-insert accounts)"
   (%dml objects conn bulk-threshold
         (lambda (o) (%insert-one o conn))
+        (lambda (list) (%collection-dml :insert list conn))
         (lambda (list) (cl-sf/bulk:bulk-insert list :conn conn))))
 
 (defun database-update (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Update OBJECTS (one SOBJECT or a sequence, all one type), each of which
-   must have an SOBJECT-ID.  Only non-NIL slots are sent.  Routing and
-   return value as for DATABASE-INSERT.
+   must have an SOBJECT-ID.  Only non-NIL slots are sent.  Routing, return
+   value and failures as for DATABASE-INSERT.
 
    Example:
      (setf (account-phone acct) \"555-9999\")
      (database-update acct)"
   (%dml objects conn bulk-threshold
         (lambda (o) (%update-one o conn))
+        (lambda (list) (%collection-dml :update list conn))
         (lambda (list) (cl-sf/bulk:bulk-update list :conn conn))))
 
 (defun database-upsert (objects external-id-field
@@ -1117,27 +1220,29 @@ Did you mean DATABASE-INSERT?"))
                           (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Upsert OBJECTS (one SOBJECT or a sequence, all one type), matching on
    EXTERNAL-ID-FIELD (the API field name string, e.g. \"External_Id__c\").
-   Routing and return value as for DATABASE-INSERT.
+   Routing, return value and failures as for DATABASE-INSERT.
 
    Example:
      (database-upsert acct \"My_External_Id__c\")"
   (%dml objects conn bulk-threshold
         (lambda (o) (%upsert-one o external-id-field conn))
+        (lambda (list) (%collection-dml :upsert list conn :external-id-field external-id-field))
         (lambda (list) (cl-sf/bulk:bulk-upsert list external-id-field :conn conn))))
 
 (defun database-delete (objects &key (conn *connection*)
                                   (bulk-threshold cl-sf/bulk:*bulk-threshold*))
   "Delete OBJECTS (one SOBJECT or a sequence, all one type), each of which
-   must have an SOBJECT-ID.  Routing as for DATABASE-INSERT; the REST path
-   returns T, the bulk path a BULK-RESULT.
+   must have an SOBJECT-ID.  Routing and failures as for DATABASE-INSERT;
+   returns T unless the bulk path is used, which returns a BULK-RESULT.
 
    Example:
      (database-delete acct)
      (database-delete accounts)"
   (let ((result (%dml objects conn bulk-threshold
                       (lambda (o) (%delete-one o conn))
+                      (lambda (list) (%collection-dml :delete list conn))
                       (lambda (list) (cl-sf/bulk:bulk-delete list :conn conn)))))
-    (if (eq result objects) t result)))
+    (if (or (eq result objects) (eq result t)) t result)))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Dynamic class generation

@@ -48,6 +48,9 @@
                cl-sf/api:sf-api-error-http-status
                cl-sf/api:sf-api-error-code
                cl-sf/api:sf-api-error-fields
+               cl-sf/api:sf-dml-error
+               cl-sf/api:sf-dml-error-failures
+               cl-sf/api:sf-dml-error-succeeded
                cl-sf/api:api-request)
              '#:cl-sf)
 
@@ -104,6 +107,9 @@
   (cl:export '(sf-auth-error
                sf-token-error
                sf-api-error
+               sf-dml-error
+               sf-dml-error-failures
+               sf-dml-error-succeeded
                bulk-error
                bulk-timeout-error
                bulk-job-failed-error

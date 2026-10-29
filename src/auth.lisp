@@ -82,12 +82,17 @@
    first call that needs parallelism to change it — these are
    network-bound tasks, not CPU-bound, so a higher count can still help.")
 
+(defvar *kernel-lock* (sb-thread:make-mutex :name "cl-sf kernel creation"))
+
 (defun %ensure-lparallel-kernel ()
   "Lazily create LPARALLEL:*KERNEL* on first use, so callers never need to
    know cl-sf uses lparallel internally.  Never overrides a kernel the
-   host application already set up itself."
+   host application already set up itself.  Safe to call from several
+   threads at once."
   (unless lparallel:*kernel*
-    (setf lparallel:*kernel* (lparallel:make-kernel *lparallel-worker-count*))))
+    (sb-thread:with-mutex (*kernel-lock*)
+      (unless lparallel:*kernel*
+        (setf lparallel:*kernel* (lparallel:make-kernel *lparallel-worker-count*))))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Token validity
@@ -217,14 +222,28 @@
 ;;; Token refresh (public)
 ;;; ──────────────────────────────────────────────────────────────────
 
-(defun refresh-token (&key (conn *connection*))
+(defvar *refresh-lock* (sb-thread:make-mutex :name "cl-sf token refresh")
+  "Serializes token refreshes: concurrent requests that all get a 401 must
+   not each spend (and possibly rotate) the same refresh token.
+   ponytail: one global lock, not one per connection — refreshes are rare.")
+
+(defun refresh-token (&key (conn *connection*) if-stale)
   "Exchange the refresh token in CONN for a fresh access token.
-   Mutates CONN in place and returns it.  If CONN came from
+   Mutates CONN in place and returns it.  Thread-safe: refreshes are
+   serialized, and if IF-STALE (the access token a failed request used) is
+   no longer CONN's current token, another thread already refreshed it and
+   this returns CONN without another round trip.  If CONN came from
    CONNECT/CACHED-CREDENTIALS (CONNECTION-USERNAME is set), also writes the
    refreshed tokens back to ~/.sf and ~/.sfdx so the real sf/sfdx CLI and
    other tools observe the same session.
    Signals SF-AUTH-ERROR for JWT connections (no refresh token)."
   (declare (type connection conn))
+  (sb-thread:with-mutex (*refresh-lock*)
+   (when (and if-stale (not (equal if-stale (connection-access-token conn))))
+     (return-from refresh-token conn))
+   (%refresh-token-locked conn)))
+
+(defun %refresh-token-locked (conn)
   (unless (connection-refresh-token conn)
     (error 'sf-auth-error
            :message "Connection has no refresh token. \

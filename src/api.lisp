@@ -32,6 +32,15 @@
 ;;; Internal helpers
 ;;; ──────────────────────────────────────────────────────────────────
 
+(define-condition sf-dml-error (sf-api-error)
+  ((failures  :initarg :failures  :reader sf-dml-error-failures :initform nil
+              :documentation "List of (SOBJECT . error-string), one per failed record.")
+   (succeeded :initarg :succeeded :reader sf-dml-error-succeeded :initform 0
+              :documentation "How many records of the call did succeed (and are committed)."))
+  (:documentation
+   "A DATABASE-* call finished, but some records failed.  Records that
+    succeeded stay committed; FAILURES says which did not and why."))
+
 (defun %absolute-url-p (path)
   "Return T if PATH is an absolute URL (starts with http:// or https://)."
   (or (and (>= (length path) 7)  (string= path "http://"  :end1 7))
@@ -145,11 +154,13 @@
                    (dex:http-request-failed (e)
                      (values (dex:response-body e) (dex:response-status e))))
                (cons resp-body status)))))
-    (let* ((result  (attempt))
-           ;; On 401: refresh token and try once more
+    (let* ((used    (connection-access-token conn))
+           (result  (attempt))
+           ;; On 401: refresh token (once, even if many threads hit this
+           ;; together — see REFRESH-TOKEN's IF-STALE) and try once more
            (result  (if (/= (cdr result) 401)
                         result
-                        (progn (refresh-token :conn conn) (attempt))))
+                        (progn (refresh-token :conn conn :if-stale used) (attempt))))
            (body    (car result))
            (status  (cdr result)))
       (cond
@@ -205,6 +216,36 @@
       (dolist (records (nreverse pages) out)
         (map nil (lambda (r) (setf (svref out i) (funcall coercer r)) (incf i))
              records)))))
+
+(defparameter *collection-max-records* 200
+  "Salesforce's limit on records per sObject Collections request.")
+
+(defun %collection-body (records)
+  (let ((h (make-hash-table :test #'equal)))
+    (setf (gethash "allOrNone" h) nil
+          (gethash "records" h) (coerce records 'vector))
+    h))
+
+(defun %collection-create (conn records)
+  "POST /composite/sobjects — insert up to 200 RECORDS (hash-tables that
+   each carry \"attributes\": {\"type\": ...}).  Returns a vector with one
+   result hash-table per record, in order: {\"id\", \"success\", \"errors\"}."
+  (api-request :post "composite/sobjects" :conn conn :body (%collection-body records)))
+
+(defun %collection-update (conn records)
+  "PATCH /composite/sobjects — update up to 200 RECORDS (each with an Id)."
+  (api-request :patch "composite/sobjects" :conn conn :body (%collection-body records)))
+
+(defun %collection-upsert (conn type external-id-field records)
+  "PATCH /composite/sobjects/TYPE/FIELD — upsert up to 200 RECORDS of one TYPE."
+  (api-request :patch (format nil "composite/sobjects/~A/~A" type external-id-field)
+               :conn conn :body (%collection-body records)))
+
+(defun %collection-delete (conn ids)
+  "DELETE /composite/sobjects?ids=... — delete up to 200 records by Id."
+  (api-request :delete "composite/sobjects" :conn conn
+               :params `(("ids" . ,(format nil "~{~A~^,~}" ids))
+                         ("allOrNone" . "false"))))
 
 ;;; ──────────────────────────────────────────────────────────────────
 ;;; Internal sObject CRUD functions

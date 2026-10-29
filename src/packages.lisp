@@ -84,6 +84,9 @@
    #:sf-api-error-http-status
    #:sf-api-error-code
    #:sf-api-error-fields
+   #:sf-dml-error
+   #:sf-dml-error-failures
+   #:sf-dml-error-succeeded
    ;; Raw escape hatch
    #:api-request))
 

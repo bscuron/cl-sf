@@ -406,35 +406,48 @@
         (is string= "Hopper" (test-contact-last-name (aref result 0)))
         (is string= "003B" (cl-sf/objects:sobject-id (aref result 1)))))))
 
-;;; ── DML routing (REST vs Bulk) ────────────────────────────────────
+
+;;; ── DML routing: single REST call / Collections API / Bulk ────────
+
+(defvar *dml-log-lock* (sb-thread:make-mutex :name "test log"))
+
+(defmacro log-push (item log)
+  `(sb-thread:with-mutex (*dml-log-lock*) (push ,item ,log)))
 
 (defmacro with-stubbed-dml ((log) &body body)
-  "Replace the REST single-record helpers and bulk entry points with stubs
-   that push (kind . detail) onto LOG."
+  "Replace the single-record REST helpers, the Collections DML step and the
+   bulk entry points with stubs that push (kind . detail) onto LOG."
   `(let ((saved (mapcar #'fdefinition
                         '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
+                          cl-sf/objects::%collection-dml
                           cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete))))
      (unwind-protect
           (progn
             (setf (fdefinition 'cl-sf/objects::%insert-one)
-                  (lambda (o conn) (declare (ignore conn)) (push (cons :rest o) ,log) o)
+                  (lambda (o conn) (declare (ignore conn)) (log-push (cons :rest o) ,log) o)
                   (fdefinition 'cl-sf/objects::%delete-one)
                   (lambda (o conn) (declare (ignore conn))
-                    (push (cons :rest-delete (cons (cl-sf/objects:sobject-type o)
-                                                   (cl-sf/objects:sobject-id o)))
-                          ,log)
+                    (log-push (list :rest-delete (cl-sf/objects:sobject-type o)
+                                    (cl-sf/objects:sobject-id o))
+                              ,log)
                     t)
+                  (fdefinition 'cl-sf/objects::%collection-dml)
+                  (lambda (op objects conn &key external-id-field)
+                    (declare (ignore conn))
+                    (log-push (list :collection op (length objects)
+                                    (cl-sf/objects:sobject-type (first objects))
+                                    external-id-field)
+                              ,log)
+                    objects)
                   (fdefinition 'cl-sf/bulk:bulk-insert)
                   (lambda (objs &key conn) (declare (ignore conn))
-                    (push (cons :bulk (length objs)) ,log) :bulk-result)
+                    (log-push (list :bulk :insert (length objs)) ,log) :bulk-result)
                   (fdefinition 'cl-sf/bulk:bulk-delete)
                   (lambda (objs &key conn) (declare (ignore conn))
-                    (push (cons :bulk-delete (cons (cl-sf/objects:sobject-type (first objs))
-                                                   (length objs)))
-                          ,log)
-                    :bulk-result))
+                    (log-push (list :bulk :delete (length objs)) ,log) :bulk-result))
             ,@body)
        (loop for name in '(cl-sf/objects::%insert-one cl-sf/objects::%delete-one
+                           cl-sf/objects::%collection-dml
                            cl-sf/bulk:bulk-insert cl-sf/bulk:bulk-delete)
              for fn in saved
              do (setf (fdefinition name) fn)))))
@@ -461,25 +474,47 @@
             ,@body)
        (setf (fdefinition 'cl-sf/api::%describe-global) orig))))
 
+(defun contacts (n)
+  (loop for i below n
+        collect (make-instance 'test-contact :last-name (format nil "~D" i)
+                                             :id (format nil "003~12,'0D" i))))
+
 (define-test database-insert/routes-by-count
   :parent objects
-  (let ((log '()) (objs (loop repeat 3 collect (make-instance 'test-contact))))
+  (let ((log '()) (objs (contacts 3)))
     (with-stubbed-dml (log)
+      ;; one object -> a single REST call, returns the object
       (is eq (first objs) (cl-sf/objects:database-insert (first objs)))
       (is equal :rest (car (first log)))
+      ;; a sequence at or below the threshold -> Collections, returns the sequence
       (setf log '())
       (is eq objs (cl-sf/objects:database-insert objs :bulk-threshold 3))
-      (is = 3 (length log))
+      (is equal '((:collection :insert 3 "TestContact" nil)) log)
+      ;; above the threshold -> one bulk call
       (setf log '())
       (is eq :bulk-result (cl-sf/objects:database-insert objs :bulk-threshold 2))
-      (is equal '((:bulk . 3)) log)
-      ;; a vector reaches the bulk function as a list; NIL threshold never uses bulk
+      (is equal '((:bulk :insert 3)) log)
+      ;; vectors work; 0 always bulk; NIL never bulk
       (setf log '())
       (cl-sf/objects:database-insert (coerce objs 'vector) :bulk-threshold 0)
-      (is equal '((:bulk . 3)) log)
+      (is equal '((:bulk :insert 3)) log)
       (setf log '())
       (cl-sf/objects:database-insert (coerce objs 'vector) :bulk-threshold nil)
-      (is = 3 (length log)))))
+      (is equal '((:collection :insert 3 "TestContact" nil)) log)
+      ;; an empty sequence sends nothing
+      (setf log '())
+      (cl-sf/objects:database-insert '())
+      (is equal '() log))))
+
+(define-test database-upsert-and-update/pass-through-the-operation
+  :parent objects
+  (let ((log '()) (objs (contacts 2)))
+    (with-stubbed-dml (log)
+      (cl-sf/objects:database-upsert objs "Ext__c")
+      (cl-sf/objects:database-update objs)
+      (is equal '((:collection :update 2 "TestContact" nil)
+                  (:collection :upsert 2 "TestContact" "Ext__c"))
+          log))))
 
 (define-test sobject-type-of-id/uses-key-prefix
   :parent objects
@@ -494,25 +529,24 @@
   :parent objects
   (with-key-prefixes (conn ("001" "Account") ("003" "Contact"))
     (let ((log '())
-          (typed   (make-instance 'test-contact :id "003xx000004TmiQAAS"))
           (untyped (make-instance 'cl-sf/objects:sobject :id "001xx000003DGb2AAG")))
       (with-stubbed-dml (log)
         (is eq t (cl-sf/objects:database-delete untyped :conn conn))
-        (is equal '(:rest-delete "Account" . "001xx000003DGb2AAG") (first log))
+        (is equal '(:rest-delete "Account" "001xx000003DGb2AAG") (first log))
         ;; the inferred type is stored on the object
         (is string= "Account" (cl-sf/objects:sobject-type untyped))
         (setf log '())
-        (is eq t (cl-sf/objects:database-delete (list typed) :conn conn))
-        (is equal '(:rest-delete "TestContact" . "003xx000004TmiQAAS") (first log))))))
+        (is eq t (cl-sf/objects:database-delete (list untyped) :conn conn))
+        (is equal '((:collection :delete 1 "Account" nil)) log)))))
 
-(define-test database-delete/bulk-route-returns-the-bulk-result
+(define-test database-delete/routes-and-returns
   :parent objects
-  (let ((log '())
-        (objs (loop for id in '("003A" "003B" "003C")
-                    collect (make-instance 'test-contact :id id))))
+  (let ((log '()) (objs (contacts 3)))
     (with-stubbed-dml (log)
+      (is eq t (cl-sf/objects:database-delete objs))
+      (is eq t (cl-sf/objects:database-delete (first objs)))
       (is eq :bulk-result (cl-sf/objects:database-delete objs :bulk-threshold 1))
-      (is equal '((:bulk-delete "TestContact" . 3)) log))))
+      (is equal '(:bulk :delete 3) (first log)))))
 
 (define-test database-calls/mixed-types-are-an-error
   :parent objects
@@ -526,12 +560,7 @@
         (fail (cl-sf/objects:database-upsert (list a c) "Ext__c" :conn conn) 'cl-sf/api:sf-api-error)
         (fail (cl-sf/objects:database-delete (list a c) :conn conn :bulk-threshold 0)
               'cl-sf/api:sf-api-error)
-        ;; nothing was sent
         (is equal '() log)))))
-
-(define-test database-delete/sobject-without-id-is-an-error
-  :parent objects
-  (fail (cl-sf/objects:database-delete (make-instance 'test-contact)) 'cl-sf/api:sf-api-error))
 
 (define-test database-calls/non-sobjects-are-an-sf-api-error
   :parent objects
@@ -543,3 +572,128 @@
       (fail (cl-sf/objects:database-insert (list (make-instance 'test-contact) :oops))
             'cl-sf/api:sf-api-error)
       (is equal '() log))))
+
+(define-test database-delete/sobject-without-id-is-an-error
+  :parent objects
+  (fail (cl-sf/objects:database-delete (make-instance 'test-contact)) 'cl-sf/api:sf-api-error)
+  (fail (cl-sf/objects:database-delete (list (make-instance 'test-contact))) 'cl-sf/api:sf-api-error))
+
+;;; ── The Collections API step itself ───────────────────────────────
+
+(defun last-name-of (r)
+  (if (hash-table-p r) (gethash "LastName" r) r))
+
+(defmacro with-stubbed-collection-api ((log &key fail-names fail-request-containing) &body body)
+  "Stub the Collections HTTP calls.  Each logs (op . record-count) and answers
+   per record: success with id ID-<LastName>, or failure when the record's
+   LastName is in FAIL-NAMES.  A request containing FAIL-REQUEST-CONTAINING
+   signals SF-API-ERROR as a whole."
+  `(let* ((names '(cl-sf/api::%collection-create cl-sf/api::%collection-update
+                   cl-sf/api::%collection-upsert cl-sf/api::%collection-delete))
+          (saved (mapcar #'fdefinition names)))
+     (unwind-protect
+          (flet ((answer (op records)
+                   (log-push (cons op (length records)) ,log)
+                   (when (and ,fail-request-containing
+                              (find ,fail-request-containing records
+                                    :key #'last-name-of :test #'equal))
+                     (error 'cl-sf/api:sf-api-error :message "request rejected" :http-status 400))
+                   (map 'vector
+                        (lambda (r)
+                          (let ((name (last-name-of r))
+                                (h (make-hash-table :test #'equal)))
+                            (cond ((member name ,fail-names :test #'equal)
+                                   (let ((e (make-hash-table :test #'equal)))
+                                     (setf (gethash "statusCode" e) "REQUIRED_FIELD_MISSING"
+                                           (gethash "message" e) "Required fields are missing"
+                                           (gethash "fields" e) (vector "LastName")
+                                           (gethash "success" h) nil
+                                           (gethash "errors" h) (vector e))))
+                                  (t (setf (gethash "success" h) t
+                                           (gethash "id" h) (format nil "ID-~A" name))))
+                            h))
+                        records)))
+            (setf (fdefinition 'cl-sf/api::%collection-create)
+                  (lambda (conn records) (declare (ignore conn)) (answer :create records))
+                  (fdefinition 'cl-sf/api::%collection-update)
+                  (lambda (conn records) (declare (ignore conn)) (answer :update records))
+                  (fdefinition 'cl-sf/api::%collection-upsert)
+                  (lambda (conn type field records) (declare (ignore conn))
+                    (log-push (list :upsert-target type field) ,log)
+                    (answer :upsert records))
+                  (fdefinition 'cl-sf/api::%collection-delete)
+                  (lambda (conn ids) (declare (ignore conn)) (answer :delete ids)))
+            ,@body)
+       (loop for name in names for fn in saved do (setf (fdefinition name) fn)))))
+
+(defun numbered-contacts (n)
+  (loop for i below n collect (make-instance 'test-contact :last-name (format nil "~D" i))))
+
+(define-test collection-dml/splits-into-requests-of-200-and-sets-ids-in-order
+  :parent objects
+  (let ((log '()) (objs (numbered-contacts 450)))
+    (with-stubbed-collection-api (log)
+      (is eq objs (cl-sf/objects:database-insert objs :bulk-threshold nil))
+      (is equal '(50 200 200) (sort (mapcar #'cdr log) #'<))
+      (is equal (loop for i below 450 collect (format nil "ID-~D" i))
+          (mapcar #'cl-sf/objects:sobject-id objs)))))
+
+(define-test collection-dml/reports-failed-records-after-processing-everything
+  :parent objects
+  (let ((log '()) (objs (numbered-contacts 450)))
+    (with-stubbed-collection-api (log :fail-names '("7" "300"))
+      (let ((condition (handler-case (progn (cl-sf/objects:database-insert objs :bulk-threshold nil) nil)
+                         (cl-sf/api:sf-dml-error (e) e))))
+        (true condition)
+        (is = 448 (cl-sf/api:sf-dml-error-succeeded condition))
+        (is equal '("7" "300")
+            (mapcar (lambda (f) (test-contact-last-name (car f)))
+                    (cl-sf/api:sf-dml-error-failures condition)))
+        (true (search "REQUIRED_FIELD_MISSING: Required fields are missing (LastName)"
+                      (cdr (first (cl-sf/api:sf-dml-error-failures condition)))))
+        (true (search "2 of 450 records failed" (cl-sf/api:sf-api-error-message condition)))
+        ;; every chunk was still sent, and the successes got their Ids
+        (is = 3 (length log))
+        (is string= "ID-8" (cl-sf/objects:sobject-id (nth 8 objs)))
+        (false (cl-sf/objects:sobject-id (nth 7 objs)))))))
+
+(define-test collection-dml/a-rejected-request-fails-only-its-own-records
+  :parent objects
+  (let ((log '()) (objs (numbered-contacts 450)))
+    (with-stubbed-collection-api (log :fail-request-containing "250")
+      (let ((condition (handler-case (progn (cl-sf/objects:database-insert objs :bulk-threshold nil) nil)
+                         (cl-sf/api:sf-dml-error (e) e))))
+        (is = 250 (cl-sf/api:sf-dml-error-succeeded condition))
+        (is = 200 (length (cl-sf/api:sf-dml-error-failures condition)))
+        (true (search "request rejected" (cdr (first (cl-sf/api:sf-dml-error-failures condition)))))
+        (is string= "ID-0" (cl-sf/objects:sobject-id (first objs)))
+        (false (cl-sf/objects:sobject-id (nth 250 objs)))))))
+
+(define-test collection-dml/update-and-delete-need-ids-before-sending-anything
+  :parent objects
+  (let ((log '()) (objs (list (make-instance 'test-contact :last-name "a" :id "003A")
+                              (make-instance 'test-contact :last-name "b"))))
+    (with-stubbed-collection-api (log)
+      (fail (cl-sf/objects:database-update objs) 'cl-sf/api:sf-api-error)
+      (fail (cl-sf/objects:database-delete objs) 'cl-sf/api:sf-api-error)
+      (is equal '() log))))
+
+(define-test collection-dml/request-bodies
+  :parent objects
+  (let ((rec (cl-sf/objects::%collection-record
+              (make-instance 'test-contact :last-name "Hopper" :id "003X") "TestContact" :id "003X")))
+    (is string= "TestContact" (gethash "type" (gethash "attributes" rec)))
+    (is string= "Hopper" (gethash "LastName" rec))
+    (is string= "003X" (gethash "Id" rec)))
+  (false (gethash "Id" (cl-sf/objects::%collection-record
+                        (make-instance 'test-contact :id "003X") "TestContact")))
+  (let ((body (cl-sf/api::%collection-body (list (make-hash-table)))))
+    (is equal nil (gethash "allOrNone" body))
+    (true (simple-vector-p (gethash "records" body)))))
+
+(define-test collection-dml/upsert-targets-type-and-external-id-field
+  :parent objects
+  (let ((log '()) (objs (numbered-contacts 3)))
+    (with-stubbed-collection-api (log)
+      (cl-sf/objects:database-upsert objs "Ext__c")
+      (true (member '(:upsert-target "TestContact" "Ext__c") log :test #'equal)))))

@@ -510,3 +510,35 @@
     (true (search "code_challenge=CHAL" url))
     (true (search "code_challenge_method=S256" url)))
   (false (search "code_challenge" (cl-sf/auth:connect/web-server :client-id "x"))))
+
+;;; ── Token refresh under concurrency ───────────────────────────────
+
+(define-test refresh-token/skips-when-another-thread-already-refreshed
+  :parent auth
+  ;; No network stub: if this tried to refresh it would fail.
+  (let ((conn (cl-sf/auth:make-connection :access-token "NEW" :refresh-token "R")))
+    (is eq conn (cl-sf/auth:refresh-token :conn conn :if-stale "OLD"))
+    (is string= "NEW" (cl-sf/auth:connection-access-token conn))))
+
+(define-test refresh-token/concurrent-401s-refresh-once
+  :parent auth
+  (let* ((calls 0)
+         (lock (sb-thread:make-mutex))
+         (conn (cl-sf/auth:make-connection :access-token "OLD" :refresh-token "R"
+                                           :login-url "https://login.example.com"))
+         (orig (fdefinition 'cl-sf/auth::%do-token-request)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'cl-sf/auth::%do-token-request)
+                 (lambda (&rest args) (declare (ignore args))
+                   (sb-thread:with-mutex (lock) (incf calls))
+                   (sleep 0.2)               ; widen the race window
+                   (cl-sf/auth:make-connection :access-token "NEW" :refresh-token "R2")))
+           (let ((threads (loop repeat 8
+                                collect (sb-thread:make-thread
+                                         (lambda () (cl-sf/auth:refresh-token :conn conn :if-stale "OLD"))))))
+             (mapc #'sb-thread:join-thread threads))
+           (is = 1 calls)
+           (is string= "NEW" (cl-sf/auth:connection-access-token conn))
+           (is string= "R2" (cl-sf/auth:connection-refresh-token conn)))
+      (setf (fdefinition 'cl-sf/auth::%do-token-request) orig))))
