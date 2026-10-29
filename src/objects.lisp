@@ -455,11 +455,25 @@
 ;;; define-sobject-class macro
 ;;; ──────────────────────────────────────────────────────────────────
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun %field-initarg (slot-name)
+    "The MAKE-INSTANCE keyword for a field's slot: its name, except where that
+     is one of SOBJECT's own initargs (:ID :TYPE :RAW) — a field called Type
+     is common, and sharing :TYPE with the sObject's type would fill the field
+     with the object's name (\"Opportunity\") and write it back on the next
+     update.  Those fields take :<NAME>-FIELD instead."
+    (let ((key (alexandria:make-keyword slot-name)))
+      (if (member key '(:id :type :raw))
+          (alexandria:make-keyword (format nil "~A-FIELD" slot-name))
+          key))))
+
 (defmacro define-sobject-class (class-name sf-api-name &body field-specs)
   "Define a CLOS class CLASS-NAME representing the Salesforce object SF-API-NAME.
    Registers the class in *SOBJECT-CLASSES* and its field map in *SOBJECT-SLOT-MAPS*.
 
    FIELD-SPECS — list of (slot-name sf-field-name &key type documentation sf-type)
+   A field whose slot name is ID, TYPE or RAW is set with :ID-FIELD, :TYPE-FIELD
+   or :RAW-FIELD (the plain keywords belong to SOBJECT itself).
    SF-TYPE \"date\" or \"datetime\" makes the slot hold a LOCAL-TIME:TIMESTAMP:
    text from Salesforce is parsed on the way in, and a timestamp is written
    back as text by SOBJECT->HASH-TABLE and the Bulk CSV writer.
@@ -485,7 +499,7 @@
                         spec
                       (declare (ignore sf-name sf-type))
                       `(,slot-name
-                        :initarg       ,(alexandria:make-keyword slot-name)
+                        :initarg       ,(%field-initarg slot-name)
                         :accessor      ,(intern (format nil "~A-~A"
                                                         class-name slot-name))
                         :initform      nil

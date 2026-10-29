@@ -50,7 +50,7 @@
         (gql-describe "Group" :fields '("Id" "Name"))
         (gql-describe "Lead" :fields '("Id" "Company")
                              :parents '(("OwnerId" "Owner" "Group" "User")))
-        (gql-describe "GqlThing__c" :fields '("Id" "Name" "Score__c" "CreatedById"
+        (gql-describe "GqlThing__c" :fields '("Id" "Name" "Type" "Score__c" "CreatedById"
                                               ("Seen__c" . "datetime") ("Born__c" . "date")
                                               ("CreatedDate" . "datetime")))))
 
@@ -652,3 +652,40 @@
             do (check (local-time:encode-timestamp 999999999 59 59 23 day month year :offset 0))
                (check (local-time:encode-timestamp 0 0 0 0 day month year :offset 0))))
     (is equal '() mismatches)))
+
+;;; ── A field called Type must not collide with the sObject's own type ──
+
+(define-test sobject/a-field-called-type-is-not-filled-with-the-object-name
+  :parent temporal
+  (with-gql-org (requests)
+    (let* ((desc (find "GqlThing__c" *gql-org* :key (lambda (d) (gethash "name" d)) :test #'string=))
+           (class-name (cl-sf/objects::%eval-define-sobject-class "GqlThing__c" desc))
+           (slots (gethash class-name cl-sf/objects:*sobject-slot-maps*))
+           (type-slot (cdr (assoc "Type" slots :test #'equal)))
+           (thing (make-instance class-name)))
+      (true type-slot "the Type field has a slot")
+      (is string= "GqlThing__c" (cl-sf/objects:sobject-type thing) "the sObject type is still set")
+      (false (slot-value thing type-slot) "...and the Type field is empty, not \"GqlThing__c\"")
+      (false (nth-value 1 (gethash "Type" (cl-sf/objects:sobject->hash-table thing)))
+             "an empty Type is not written back")
+      ;; the field has its own initarg
+      (let ((typed (make-instance class-name :type-field "Customer")))
+        (is string= "Customer" (slot-value typed type-slot))
+        (is string= "GqlThing__c" (cl-sf/objects:sobject-type typed))
+        (is string= "Customer" (gethash "Type" (cl-sf/objects:sobject->hash-table typed))))
+      ;; a fetched record whose Type is null keeps it empty
+      (let ((fetched (cl-sf/objects:hash->sobject
+                      (probe-hash "Id" "a01" "Name" "n" "Type" 'null) "GqlThing__c")))
+        (false (slot-value fetched type-slot))
+        (false (nth-value 1 (gethash "Type" (cl-sf/objects:sobject->hash-table fetched))))))))
+
+(define-test sobject/define-sobject-class-renames-initargs-that-collide
+  :parent temporal
+  (cl-sf/objects:define-sobject-class collide-probe "CollideProbe__c"
+    (type "Type")
+    (name "Name"))
+  (let ((o (make-instance 'collide-probe :name "n")))
+    (is string= "CollideProbe__c" (cl-sf/objects:sobject-type o))
+    (false (slot-value o 'type))
+    (setf (slot-value o 'type) "x")
+    (is string= "x" (collide-probe-type o))))
